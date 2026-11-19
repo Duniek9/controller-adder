@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use controller_core::{
     detect_engine,
     scanner::{
+        effective::analyze_effective_inputs,
         input::scan_inputs,
         javascript::scan_javascript,
         plugins::scan_plugins,
@@ -40,6 +41,12 @@ enum Commands {
     },
     /// Scan enabled plugin JavaScript for input-related code.
     Javascript {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Build a conservative keyboard/gamepad input inventory for the GUI.
+    Effective {
         path: PathBuf,
         #[arg(long)]
         json: bool,
@@ -97,6 +104,31 @@ fn execute(command: Commands) -> Result<(), String> {
                 );
             }
             print_json(&report)?;
+        }
+        Commands::Effective { path, json } => {
+            let report = analyze_effective_inputs(&path)?;
+            if json {
+                print_json(&report)?;
+            } else {
+                println!("Engine: {}", report.engine);
+                println!("Input slots: {}", report.inputs.len());
+                println!("Unresolved actions: {}", report.unresolved_actions.len());
+                println!("Potential conflicts: {}", report.potential_conflict_count);
+                for slot in &report.inputs {
+                    let baseline = slot.core_default_actions.join(", ");
+                    println!(
+                        "  {}[{}]  {}  baseline: {}  plugin candidates: {}",
+                        slot.input_kind,
+                        slot.input_index,
+                        slot.status,
+                        if baseline.is_empty() { "none" } else { &baseline },
+                        slot.plugin_candidates.len()
+                    );
+                }
+                for warning in &report.warnings {
+                    println!("Warning: {warning}");
+                }
+            }
         }
         Commands::Resolve { path, json } => {
             let report = resolve_inputs(&path)?;
