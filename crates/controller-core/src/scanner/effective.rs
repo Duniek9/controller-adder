@@ -46,6 +46,26 @@ pub struct UnresolvedInputAction {
     pub references: usize,
 }
 
+/// Action with at least one observed non-disabled mapper write, but without
+/// proof of a live runtime binding. Distinct from a truly unresolved action.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CandidateActionBinding {
+    pub input_kind: String,
+    pub input_index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_name: Option<String>,
+    pub configuration_status: String,
+    pub context: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CandidateMappedAction {
+    pub action: String,
+    pub classification: String,
+    pub references: usize,
+    pub mapping_candidates: Vec<CandidateActionBinding>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct EffectiveInputReport {
     pub schema_version: u32,
@@ -53,8 +73,39 @@ pub struct EffectiveInputReport {
     pub resolver_schema_version: u32,
     pub inputs: Vec<EffectiveInputSlot>,
     pub unresolved_actions: Vec<UnresolvedInputAction>,
+    pub candidate_mapped_actions: Vec<CandidateMappedAction>,
     pub potential_conflict_count: usize,
     pub warnings: Vec<String>,
+}
+
+/// Best-effort human-readable labels for the legacy JavaScript keyCode values
+/// used by RPG Maker MV/MZ. These are physical key identifiers, not action names.
+/// Unknown codes remain unlabeled instead of receiving a guessed name.
+fn keyboard_key_name(index: u32) -> Option<String> {
+    let name = match index {
+        8 => "Backspace", 9 => "Tab", 13 => "Enter", 16 => "Shift",
+        17 => "Ctrl", 18 => "Alt", 27 => "Escape", 32 => "Space",
+        33 => "Page Up", 34 => "Page Down", 35 => "End", 36 => "Home",
+        37 => "Left Arrow", 38 => "Up Arrow", 39 => "Right Arrow",
+        40 => "Down Arrow", 45 => "Insert", 46 => "Delete",
+        96 => "Numpad 0", 97 => "Numpad 1", 98 => "Numpad 2",
+        99 => "Numpad 3", 100 => "Numpad 4", 101 => "Numpad 5",
+        102 => "Numpad 6", 103 => "Numpad 7", 104 => "Numpad 8",
+        105 => "Numpad 9", 106 => "Numpad *", 107 => "Numpad +",
+        109 => "Numpad -", 110 => "Numpad .", 111 => "Numpad /",
+        186 => "Semicolon", 187 => "Equal", 188 => "Comma",
+        189 => "Minus", 190 => "Period", 191 => "Slash", 192 => "Backquote",
+        219 => "Left Bracket", 220 => "Backslash", 221 => "Right Bracket",
+        222 => "Quote",
+        _ => {
+            return match index {
+                48..=57 | 65..=90 => char::from_u32(index).map(|c| c.to_string()),
+                112..=123 => Some(format!("F{}", index - 111)),
+                _ => None,
+            };
+        }
+    };
+    Some(name.into())
 }
 
 /// Public entry point for a future CLI / Tauri command.
@@ -129,7 +180,7 @@ pub fn build_effective_input_report(report: &InputResolutionReport) -> Effective
                 EffectiveInputSlot {
                     input_kind: kind.into(),
                     input_index: index,
-                    key_name: None,
+                    key_name: if kind == "keyboard" { keyboard_key_name(index) } else { None },
                     core_default_actions: Vec::new(),
                     plugin_candidates: Vec::new(),
                     status: String::new(),
@@ -190,25 +241,60 @@ pub fn build_effective_input_report(report: &InputResolutionReport) -> Effective
         slot.note = note.into();
     }
 
-    let unresolved_actions = report.action_catalog.iter()
+    // Build action-level evidence from the same input slots we have already
+    // evaluated. Disabled plugin assignments must not count as bindings.
+    let mut action_bindings: BTreeMap<String, Vec<CandidateActionBinding>> = BTreeMap::new();
+    for slot in slots.values() {
+        for candidate in &slot.plugin_candidates {
+            if candidate.configuration_status == "disabled_by_configuration" {
+                continue;
+            }
+            let binding = CandidateActionBinding {
+                input_kind: slot.input_kind.clone(),
+                input_index: slot.input_index,
+                key_name: slot.key_name.clone(),
+                configuration_status: candidate.configuration_status.clone(),
+                context: candidate.context.clone(),
+            };
+            let bindings = action_bindings.entry(candidate.action.clone()).or_default();
+            if !bindings.contains(&binding) {
+                bindings.push(binding);
+            }
+        }
+    }
+
+    let mut unresolved_actions = Vec::new();
+    let mut candidate_mapped_actions = Vec::new();
+    for action in report.action_catalog.iter()
         .filter(|action| action.binding_status == "unresolved_mapping")
-        .map(|action| UnresolvedInputAction {
-            action: action.action.clone(),
-            classification: action.classification.clone(),
-            references: action.references.len(),
-        })
-        .collect();
+    {
+        if let Some(bindings) = action_bindings.get(&action.action) {
+            candidate_mapped_actions.push(CandidateMappedAction {
+                action: action.action.clone(),
+                classification: action.classification.clone(),
+                references: action.references.len(),
+                mapping_candidates: bindings.clone(),
+            });
+        } else {
+            unresolved_actions.push(UnresolvedInputAction {
+                action: action.action.clone(),
+                classification: action.classification.clone(),
+                references: action.references.len(),
+            });
+        }
+    }
 
     let mut warnings = report.warnings.clone();
     warnings.push("Static input inventory: runtime mapper values and plugin execution order are not verified.".into());
     warnings.push("Core gamepad defaults are not yet scanned; gamepad slots show plugin evidence only.".into());
 
     EffectiveInputReport {
-        schema_version: 1,
+        schema_version: 2,
         engine: report.engine.clone(),
         resolver_schema_version: report.schema_version,
         inputs: slots.into_values().collect(),
         unresolved_actions,
+        candidate_mapped_actions,
         potential_conflict_count: report.mapping_conflicts.len(),
         warnings,
     }
@@ -346,4 +432,69 @@ mod tests {
         assert_eq!(output.unresolved_actions.len(), 1);
         assert_eq!(output.unresolved_actions[0].action, "attack");
     }
+
+    #[test]
+    fn reconciles_unverified_r_mapping_without_claiming_runtime_binding() {
+        let mut input = report();
+        let mut finding = assignment("keyboard", 82, "r", false);
+        finding.plugin = "lgRelicChoose".into();
+        add_candidate(&mut input, finding);
+        input.action_catalog.push(ActionCatalogEntry {
+            action: "r".into(),
+            classification: "custom_or_unmapped".into(),
+            confidence: "static_literal_reference".into(),
+            keyboard_keys: Vec::new(),
+            alias_of: None,
+            binding_status: "unresolved_mapping".into(),
+            references: Vec::new(),
+        });
+        let output = build_effective_input_report(&input);
+        assert_eq!(output.schema_version, 2);
+        assert!(output.unresolved_actions.is_empty());
+        assert_eq!(output.candidate_mapped_actions.len(), 1);
+        let action = &output.candidate_mapped_actions[0];
+        assert_eq!(action.action, "r");
+        assert_eq!(action.mapping_candidates[0].key_name.as_deref(), Some("R"));
+        assert_eq!(action.mapping_candidates[0].configuration_status, "unknown");
+    }
+
+    #[test]
+    fn disabled_assignment_does_not_resolve_an_action() {
+        let mut input = report();
+        add_candidate(&mut input, assignment("keyboard", 69, "e", true));
+        input.conditional_mapping_evaluations.push(ConditionalMappingEvaluation {
+            plugin: "YEP_ButtonCommonEvents".into(),
+            input_index: 69,
+            action: "e".into(),
+            parameter: "Key E".into(),
+            configured_value: "0".into(),
+            status: "disabled_by_configuration".into(),
+            context: "map shortcut".into(),
+        });
+        input.action_catalog.push(ActionCatalogEntry {
+            action: "e".into(),
+            classification: "custom_or_unmapped".into(),
+            confidence: "static_literal_reference".into(),
+            keyboard_keys: Vec::new(),
+            alias_of: None,
+            binding_status: "unresolved_mapping".into(),
+            references: Vec::new(),
+        });
+        let output = build_effective_input_report(&input);
+        assert_eq!(output.unresolved_actions.len(), 1);
+        assert!(output.candidate_mapped_actions.is_empty());
+    }
+
+    #[test]
+    fn labels_plugin_only_keyboard_keys_but_not_gamepad_buttons() {
+        let mut input = report();
+        add_candidate(&mut input, assignment("keyboard", 69, "e", false));
+        add_candidate(&mut input, assignment("gamepad", 1, "ok", false));
+        let output = build_effective_input_report(&input);
+        let keyboard = output.inputs.iter().find(|s| s.input_kind == "keyboard" && s.input_index == 69).unwrap();
+        let gamepad = output.inputs.iter().find(|s| s.input_kind == "gamepad" && s.input_index == 1).unwrap();
+        assert_eq!(keyboard.key_name.as_deref(), Some("E"));
+        assert!(gamepad.key_name.is_none());
+    }
+
 }
