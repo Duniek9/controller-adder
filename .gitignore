@@ -1,0 +1,23 @@
+# Rust
+target/
+**/target/
+
+# JavaScript
+node_modules/
+**/node_modules/
+.svelte-kit/
+dist/
+build/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Generated reports
+resolution-report-*.json
+
+# Editor and temporary files
+*.swp
+*.tmp
+.DS_Store

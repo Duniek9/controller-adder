@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "src-tauri",
+    "crates/controller-core"
+, "crates/controller-cli"]
+resolver = "2"
+
+default-members = [
+    "crates/controller-core"
+]
