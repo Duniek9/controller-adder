@@ -300,9 +300,13 @@ fn analyze_source(plugin: &str, source_file: &str, source: &str) -> Vec<JavaScri
     }
 
     let mapper_access = Regex::new(r"\bInput\s*\.\s*(keyMapper|gamepadMapper)\b").unwrap();
+    // End at '=': masked string literal bytes after it look like whitespace.
     let mapper_assignment = Regex::new(
-    r"\bInput\s*\.\s*(keyMapper|gamepadMapper)\s*\[\s*(\d{1,5})\s*\]\s*="
+        r"\bInput\s*\.\s*(keyMapper|gamepadMapper)\s*\[\s*(\d{1,5})\s*\]\s*="
     ).unwrap();
+    // Recognize a single-line `if (condition) Input.keyMapper[...] = 'action';`.
+    // This identifies conditional syntax, but does NOT evaluate the condition.
+    let inline_if = Regex::new(r"(?:^|[;{}]\s*|\belse\s+)if\s*\([^;\n]*\)\s*$").unwrap();
     for capture in mapper_access.captures_iter(&masked) {
         let full = capture.get(0).unwrap();
         let mapper = capture.get(1).unwrap().as_str();
@@ -332,7 +336,18 @@ fn analyze_source(plugin: &str, source_file: &str, source: &str) -> Vec<JavaScri
                             } else {
                                 "gamepad_mapping_assignment"
                             };
-                            confidence = "static_assignment";
+                            // Examine only code on the same line preceding this assignment.
+                            // The masked text hides quoted strings in the condition but
+                            // preserves the `if`, punctuation, and byte offsets.
+                            let line_start = masked[..full.start()]
+                                .rfind('\n')
+                                .map_or(0, |index| index + 1);
+                            let prefix = &masked[line_start..full.start()];
+                            confidence = if inline_if.is_match(prefix) {
+                                "static_conditional_assignment"
+                            } else {
+                                "static_assignment"
+                            };
                         }
                     }
                 }
@@ -446,6 +461,42 @@ mod tests {
         let items = findings("Input.keyMapper[keyCode] = actionName; Input.gamepadMapper[index] = getAction();");
         assert_eq!(items.len(), 2);
         assert!(items.iter().all(|item| item.mapper_index.is_none() && item.action.is_none()));
+    }
+
+    #[test]
+    fn recognizes_yanfly_conditional_mapper_assignments() {
+        // Realistic snippets from YEP_ButtonCommonEvents: all are optional.
+        let source = "if (Yanfly.Param.BCEList['q'] !== 0) Input.keyMapper[81] = 'q';\n\
+                      if (Yanfly.Param.BCEList['e'] !== 0) Input.keyMapper[69] = 'e';\n\
+                      if (Yanfly.Param.BCEList['dirLeft'] !== 0) Input.keyMapper[37] = 'dirLeft';";
+        let items = findings(source);
+        assert_eq!(items.len(), 3);
+        for (item, (index, action)) in items.iter().zip([(81, "q"), (69, "e"), (37, "dirLeft")]) {
+            assert_eq!(item.category, "keyboard_mapping_assignment");
+            assert_eq!(item.confidence, "static_conditional_assignment");
+            assert_eq!(item.mapper_index, Some(index));
+            assert_eq!(item.action.as_deref(), Some(action));
+        }
+    }
+
+    #[test]
+    fn distinguishes_unconditional_and_conditional_assignments() {
+        let source = "Input.keyMapper[82] = 'r';\n\
+                      if (enabled) Input.gamepadMapper[4] = 'q';\n\
+                      Input.gamepadMapper[5] = 'ok';";
+        let items = findings(source);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].confidence, "static_assignment");
+        assert_eq!(items[1].confidence, "static_conditional_assignment");
+        assert_eq!(items[2].confidence, "static_assignment");
+    }
+
+    #[test]
+    fn does_not_infer_condition_after_other_statement() {
+        let source = "if (enabled) doSomething(); Input.keyMapper[81] = 'q';";
+        let items = findings(source);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].confidence, "static_assignment");
     }
 
     #[test]
