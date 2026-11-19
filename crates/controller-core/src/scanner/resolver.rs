@@ -1,4 +1,7 @@
+use regex::Regex;
 use serde::Serialize;
+use serde_json::Value;
+use std::fs;
 use std::{collections::{BTreeMap, BTreeSet}, path::Path};
 
 use super::{
@@ -74,6 +77,19 @@ pub struct MappingConflict {
     pub plugin_assignments: Vec<MapperAssignmentEvidence>,
 }
 
+/// Configuration-specific evaluation of an inline Yanfly BCE key assignment.
+/// This verifies a numeric plugin setting, not actual runtime execution.
+#[derive(Debug, Serialize)]
+pub struct ConditionalMappingEvaluation {
+    pub plugin: String,
+    pub input_index: u32,
+    pub action: String,
+    pub parameter: String,
+    pub configured_value: String,
+    pub status: String,
+    pub context: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct InputResolutionReport {
     pub schema_version: u32,
@@ -82,6 +98,7 @@ pub struct InputResolutionReport {
     pub plugin_candidates: Vec<PluginInputCandidate>,
     pub action_catalog: Vec<ActionCatalogEntry>,
     pub mapping_conflicts: Vec<MappingConflict>,
+    pub conditional_mapping_evaluations: Vec<ConditionalMappingEvaluation>,
     pub plugins_scanned: usize,
     pub skipped_plugins: Vec<SkippedPlugin>,
     pub warnings: Vec<String>,
@@ -122,7 +139,11 @@ pub fn resolve_inputs(path: &Path) -> Result<InputResolutionReport, String> {
 
     let plugin_candidates = group_plugin_evidence(parameters, findings);
     let action_catalog = build_action_catalog(&core_actions, &plugin_candidates);
-    let mapping_conflicts = detect_mapping_conflicts(&core_actions, &plugin_candidates);
+    let conditional_mapping_evaluations = evaluate_yanfly_config(path, &plugin_candidates);
+    let mapping_conflicts = filter_disabled_conflicts(
+        detect_mapping_conflicts(&core_actions, &plugin_candidates),
+        &conditional_mapping_evaluations,
+    );
 
     if !skipped_plugins.is_empty() {
         warnings.push(format!(
@@ -132,12 +153,13 @@ pub fn resolve_inputs(path: &Path) -> Result<InputResolutionReport, String> {
     }
 
     Ok(InputResolutionReport {
-        schema_version: 3,
+        schema_version: 4,
         engine,
         core_actions,
         plugin_candidates,
         action_catalog,
         mapping_conflicts,
+        conditional_mapping_evaluations,
         plugins_scanned,
         skipped_plugins,
         warnings,
@@ -404,6 +426,122 @@ fn detect_mapping_conflicts(
     conflicts
 }
 
+/// Evaluate only the verified YEP_ButtonCommonEvents pattern:
+/// `BCEList.foo = Number(Yanfly.Parameters['Key ...'])` and
+/// `if (BCEList['foo'] !== 0) Input.keyMapper[n] = 'foo'`.
+/// Any unsupported syntax or missing configuration stays unknown.
+fn evaluate_yanfly_config(
+    game: &Path,
+    candidates: &[PluginInputCandidate],
+) -> Vec<ConditionalMappingEvaluation> {
+    let Some(plugin) = candidates.iter().find(|p| p.plugin == "YEP_ButtonCommonEvents") else {
+        return Vec::new();
+    };
+    let Some(js_dir) = [game.join("js"), game.join("www/js")]
+        .into_iter()
+        .find(|dir| dir.join("plugins.js").is_file())
+    else {
+        return Vec::new();
+    };
+    let Ok(registry_source) = fs::read_to_string(js_dir.join("plugins.js")) else {
+        return Vec::new();
+    };
+    let (Some(start), Some(end)) = (registry_source.find('['), registry_source.rfind(']')) else {
+        return Vec::new();
+    };
+    if end < start { return Vec::new(); }
+    let Ok(registry) = serde_json::from_str::<Value>(&registry_source[start..=end]) else {
+        return Vec::new();
+    };
+    let Some(config) = registry.as_array().and_then(|entries| entries.iter().find(|entry| {
+        entry.get("name").and_then(Value::as_str) == Some("YEP_ButtonCommonEvents")
+            && entry.get("status") == Some(&Value::Bool(true))
+    })) else {
+        return Vec::new();
+    };
+    let Some(parameters) = config.get("parameters").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let Ok(source) = fs::read_to_string(js_dir.join("plugins/YEP_ButtonCommonEvents.js")) else {
+        return Vec::new();
+    };
+    let definitions = Regex::new(
+        r#"(?m)^\s*([A-Za-z0-9_]+)\s*:\s*Number\(Yanfly\.Parameters\['([^']+)'\]\)"#,
+    ).unwrap();
+    let assignments = Regex::new(
+        r#"if\s*\(\s*Yanfly\.Param\.BCEList\['([^']+)'\]\s*!==\s*0\s*\)\s*Input\.keyMapper\[(\d+)\]\s*=\s*'([^']+)'"#,
+    ).unwrap();
+
+    let names: BTreeMap<String, String> = definitions.captures_iter(&source).map(|cap| {
+        (cap[1].to_string(), cap[2].replace("\\\\", "\\"))
+    }).collect();
+    let guarded: BTreeSet<(String, u32)> = assignments.captures_iter(&source).filter_map(|cap| {
+        let code = cap[2].parse::<u32>().ok()?;
+        if cap[1] != cap[3] { return None; }
+        Some((cap[3].to_string(), code))
+    }).collect();
+
+    plugin.javascript_findings.iter().filter_map(|finding| {
+        if finding.category != "keyboard_mapping_assignment"
+            || finding.confidence != "static_conditional_assignment"
+        {
+            return None;
+        }
+        let action = finding.action.as_ref()?;
+        let index = finding.mapper_index?;
+        if !guarded.contains(&(action.clone(), index)) { return None; }
+        let parameter = names.get(action)?;
+        let value = parameters.get(parameter).and_then(Value::as_str)?;
+        let status = if value.trim().is_empty() {
+            "disabled_by_configuration"
+        } else if let Ok(number) = value.trim().parse::<f64>() {
+            if number.is_nan() { "unknown" }
+            else if number == 0.0 { "disabled_by_configuration" }
+            else { "enabled_by_configuration" }
+        } else {
+            "unknown"
+        };
+        Some(ConditionalMappingEvaluation {
+            plugin: plugin.plugin.clone(),
+            input_index: index,
+            action: action.clone(),
+            parameter: parameter.clone(),
+            configured_value: value.to_string(),
+            status: status.into(),
+            context: "YEP_ButtonCommonEvents map shortcut; not confirmed at runtime".into(),
+        })
+    }).collect()
+}
+
+/// Remove only *proven disabled-by-configuration* assignments from the
+/// potential-conflict view; retain other plugins and unresolved conditions.
+fn filter_disabled_conflicts(
+    conflicts: Vec<MappingConflict>,
+    evaluations: &[ConditionalMappingEvaluation],
+) -> Vec<MappingConflict> {
+    let disabled: BTreeSet<(&str, u32, &str)> = evaluations.iter()
+        .filter(|e| e.status == "disabled_by_configuration")
+        .map(|e| (e.plugin.as_str(), e.input_index, e.action.as_str()))
+        .collect();
+    conflicts.into_iter().filter_map(|mut conflict| {
+        if conflict.input_kind == "keyboard" {
+            conflict.plugin_assignments.retain(|a| {
+                !disabled.contains(&(a.plugin.as_str(), conflict.input_index, a.action.as_str()))
+            });
+        }
+        let plugin_actions: BTreeSet<&str> = conflict.plugin_assignments.iter()
+            .map(|a| a.action.as_str()).collect();
+        let baseline: BTreeSet<&str> = conflict.core_actions.iter().map(String::as_str).collect();
+        let override_core = !baseline.is_empty()
+            && plugin_actions.iter().any(|action| !baseline.contains(action));
+        let collision = plugin_actions.len() > 1;
+        conflict.conflict_types.clear();
+        if override_core { conflict.conflict_types.push("potential_core_override".into()); }
+        if collision { conflict.conflict_types.push("potential_plugin_collision".into()); }
+        if conflict.conflict_types.is_empty() { None } else { Some(conflict) }
+    }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +758,39 @@ mod tests {
         dynamic.category = "keyboard_mapping_access".into();
         let plugins = group_plugin_evidence(Vec::new(), vec![dynamic]);
         assert!(detect_mapping_conflicts(&[core_action("pageup", 81, "Q")], &plugins).is_empty());
+    }
+
+    #[test]
+    fn disabled_yanfly_mapping_does_not_count_as_override() {
+        let core = vec![core_action("pageup", 81, "Q")];
+        let plugins = group_plugin_evidence(Vec::new(), vec![
+            mapping("YEP_ButtonCommonEvents", "keyboard", 81, "q", true),
+        ]);
+        let evaluations = vec![ConditionalMappingEvaluation {
+            plugin: "YEP_ButtonCommonEvents".into(),
+            input_index: 81,
+            action: "q".into(),
+            parameter: "Key Q (PageUp)".into(),
+            configured_value: "".into(),
+            status: "disabled_by_configuration".into(),
+            context: "map shortcut".into(),
+        }];
+        let conflicts = filter_disabled_conflicts(
+            detect_mapping_conflicts(&core, &plugins), &evaluations,
+        );
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn unknown_yanfly_mapping_remains_a_potential_conflict() {
+        let core = vec![core_action("pageup", 81, "Q")];
+        let plugins = group_plugin_evidence(Vec::new(), vec![
+            mapping("YEP_ButtonCommonEvents", "keyboard", 81, "q", true),
+        ]);
+        let conflicts = filter_disabled_conflicts(
+            detect_mapping_conflicts(&core, &plugins), &[],
+        );
+        assert_eq!(conflicts.len(), 1);
     }
 
 }
