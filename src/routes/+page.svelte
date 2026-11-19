@@ -5,13 +5,13 @@
   import InputScanner from '../components/InputScanner.svelte';
   import PluginScanner from '../components/PluginScanner.svelte';
   import JavaScriptScanner from '../components/JavaScriptScanner.svelte';
+  import { selectedGamePath } from '../lib/stores/selectedGame';
   
 
-  let selectedGame = $state<string | null>(null);
   let detectedEngine = $state<string | null>(null);
 
   function handleGameSelected(path: string) {
-    selectedGame = path;
+    selectedGamePath.set(path);
     detectedEngine = null;
   }
 
@@ -29,18 +29,18 @@
 
   <GameSelector onGameSelected={handleGameSelected} />
 
-  {#if selectedGame}
-    {#key selectedGame}
+  {#if $selectedGamePath}
+    {#key $selectedGamePath}
       <EngineDetector
-        gamePath={selectedGame}
+        gamePath={$selectedGamePath}
         onEngineDetected={handleEngineDetected}
       />
 
       {#if detectedEngine === 'RPG Maker MZ' ||
           detectedEngine === 'RPG Maker MV'}
-        <InputScanner gamePath={selectedGame} />
-        <JavaScriptScanner gamePath={selectedGame} />
-        <PluginScanner gamePath={selectedGame} />
+        <InputScanner gamePath={$selectedGamePath} />
+        <JavaScriptScanner gamePath={$selectedGamePath} />
+        <PluginScanner gamePath={$selectedGamePath} />
       {:else if detectedEngine && detectedEngine !== 'Unknown engine'}
         <p class="notice">
           Input scanning for {detectedEngine} is not supported yet.

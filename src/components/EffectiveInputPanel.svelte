@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from '@tauri-apps/api/core';
+  import { selectedGamePath } from '../lib/stores/selectedGame';
 
   type MappingCandidate = {
     plugin: string;
@@ -39,8 +40,6 @@
     warnings: string[];
   };
 
-  // Optional: parent GameSelector can pass its selected path as `gamePath`.
-  export let gamePath = '';
 
   let report: EffectiveReport | null = null;
   let error = '';
@@ -81,7 +80,7 @@
   }
 
   async function scan() {
-    const path = gamePath.trim();
+    const path = $selectedGamePath.trim();
     if (!path) {
       error = 'Enter or select a game folder before scanning.';
       report = null;
@@ -105,6 +104,14 @@
     } finally {
       if (thisRequest === requestCounter) loading = false;
     }
+  }
+
+  function handlePathEdited() {
+    // Clear stale evidence when the selected directory changes.
+    requestCounter += 1;
+    loading = false;
+    error = '';
+    report = null;
   }
 
   $: visibleInputs = report
@@ -136,8 +143,8 @@
   <form class="path-form" on:submit|preventDefault={scan}>
     <label for="effective-path">Game directory</label>
     <div class="path-row">
-      <input id="effective-path" type="text" bind:value={gamePath} placeholder="/path/to/RPG Maker game" spellcheck="false" />
-      <button type="submit" disabled={loading || !gamePath.trim()}>{loading ? 'Scanning…' : 'Scan inputs'}</button>
+      <input id="effective-path" type="text" bind:value={$selectedGamePath} on:input={handlePathEdited} placeholder="/path/to/RPG Maker game" spellcheck="false" />
+      <button type="submit" disabled={loading || !$selectedGamePath.trim()}>{loading ? 'Scanning…' : 'Scan inputs'}</button>
     </div>
     <p class="small">Use the folder containing <code>www/js</code> or <code>js</code>. No game files are modified.</p>
   </form>
