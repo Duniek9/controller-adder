@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::{BTreeMap, BTreeSet}, path::Path};
 
 use super::{
     input::{scan_inputs, InputAction, KeyBinding},
@@ -50,6 +50,30 @@ pub struct ActionCatalogEntry {
     pub references: Vec<ActionReference>,
 }
 
+/// Source-level mapper assignment evidence. This is NOT a confirmed runtime binding.
+#[derive(Debug, Serialize)]
+pub struct MapperAssignmentEvidence {
+    pub plugin: String,
+    pub source_file: String,
+    pub line: usize,
+    pub action: String,
+    pub confidence: String,
+}
+
+/// Possible override/collision, grouped by input device and numeric input index.
+/// Conditions, execution order, and later modifications are NOT evaluated.
+#[derive(Debug, Serialize)]
+pub struct MappingConflict {
+    pub input_kind: String,
+    pub input_index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_name: Option<String>,
+    pub conflict_types: Vec<String>,
+    pub certainty: String,
+    pub core_actions: Vec<String>,
+    pub plugin_assignments: Vec<MapperAssignmentEvidence>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct InputResolutionReport {
     pub schema_version: u32,
@@ -57,6 +81,7 @@ pub struct InputResolutionReport {
     pub core_actions: Vec<ResolvedAction>,
     pub plugin_candidates: Vec<PluginInputCandidate>,
     pub action_catalog: Vec<ActionCatalogEntry>,
+    pub mapping_conflicts: Vec<MappingConflict>,
     pub plugins_scanned: usize,
     pub skipped_plugins: Vec<SkippedPlugin>,
     pub warnings: Vec<String>,
@@ -97,6 +122,7 @@ pub fn resolve_inputs(path: &Path) -> Result<InputResolutionReport, String> {
 
     let plugin_candidates = group_plugin_evidence(parameters, findings);
     let action_catalog = build_action_catalog(&core_actions, &plugin_candidates);
+    let mapping_conflicts = detect_mapping_conflicts(&core_actions, &plugin_candidates);
 
     if !skipped_plugins.is_empty() {
         warnings.push(format!(
@@ -106,11 +132,12 @@ pub fn resolve_inputs(path: &Path) -> Result<InputResolutionReport, String> {
     }
 
     Ok(InputResolutionReport {
-        schema_version: 2,
+        schema_version: 3,
         engine,
         core_actions,
         plugin_candidates,
         action_catalog,
+        mapping_conflicts,
         plugins_scanned,
         skipped_plugins,
         warnings,
@@ -277,6 +304,106 @@ fn build_action_catalog(
     catalog.into_values().collect()
 }
 
+/// Contrast statically discovered assignments with engine defaults and each other.
+/// A mapping can be conditional, unreachable, or overwritten at runtime; therefore
+/// all matches are informational candidates, not verified runtime conflicts.
+fn detect_mapping_conflicts(
+    core_actions: &[ResolvedAction],
+    plugin_candidates: &[PluginInputCandidate],
+) -> Vec<MappingConflict> {
+    // Keep keyboard and gamepad in separate namespaces even when indices match.
+    let mut core_by_key: BTreeMap<u32, (Option<String>, BTreeSet<String>)> = BTreeMap::new();
+    for action in core_actions {
+        for key in &action.keyboard_keys {
+            let entry = core_by_key
+                .entry(key.key_code)
+                .or_insert_with(|| (Some(key.key_name.clone()), BTreeSet::new()));
+            entry.1.insert(action.action.clone());
+        }
+    }
+
+    let mut by_index: BTreeMap<(String, u32), Vec<MapperAssignmentEvidence>> = BTreeMap::new();
+    for plugin in plugin_candidates {
+        for finding in &plugin.javascript_findings {
+            let kind = match finding.category.as_str() {
+                "keyboard_mapping_assignment" => "keyboard",
+                "gamepad_mapping_assignment" => "gamepad",
+                _ => continue,
+            };
+            let (Some(index), Some(action)) =
+                (finding.mapper_index, finding.action.as_deref())
+            else {
+                continue;
+            };
+            by_index
+                .entry((kind.into(), index))
+                .or_default()
+                .push(MapperAssignmentEvidence {
+                    plugin: finding.plugin.clone(),
+                    source_file: finding.source_file.clone(),
+                    line: finding.line,
+                    action: action.to_string(),
+                    confidence: finding.confidence.clone(),
+                });
+        }
+    }
+
+    let mut conflicts = Vec::new();
+    for ((kind, index), mut assignments) in by_index {
+        assignments.sort_by(|a, b| {
+            a.plugin.cmp(&b.plugin)
+                .then_with(|| a.source_file.cmp(&b.source_file))
+                .then_with(|| a.line.cmp(&b.line))
+                .then_with(|| a.action.cmp(&b.action))
+        });
+        assignments.dedup_by(|a, b| {
+            a.plugin == b.plugin
+                && a.source_file == b.source_file
+                && a.line == b.line
+                && a.action == b.action
+        });
+
+        let baseline = if kind == "keyboard" {
+            core_by_key.get(&index)
+        } else {
+            None // Gamepad core mappings aren't scanned yet.
+        };
+        let core_names: BTreeSet<String> = baseline
+            .map(|(_, names)| names.clone())
+            .unwrap_or_default();
+        let plugin_names: BTreeSet<&str> = assignments
+            .iter()
+            .map(|item| item.action.as_str())
+            .collect();
+
+        let core_override = !core_names.is_empty()
+            && plugin_names.iter().any(|name| !core_names.contains(*name));
+        let plugin_collision = plugin_names.len() > 1;
+        if !core_override && !plugin_collision {
+            continue;
+        }
+
+        let mut conflict_types = Vec::new();
+        if core_override {
+            conflict_types.push("potential_core_override".into());
+        }
+        if plugin_collision {
+            conflict_types.push("potential_plugin_collision".into());
+        }
+
+        conflicts.push(MappingConflict {
+            input_kind: kind,
+            input_index: index,
+            key_name: baseline.and_then(|(label, _)| label.clone()),
+            conflict_types,
+            certainty: "potential_static_evidence".into(),
+            core_actions: core_names.into_iter().collect(),
+            plugin_assignments: assignments,
+        });
+    }
+    conflicts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,4 +539,87 @@ mod tests {
         assert!(build_action_catalog(&[], &candidates).is_empty());
         assert_eq!(candidates[0].javascript_findings[0].mapper_index, Some(81));
     }
+
+    fn mapping(plugin: &str, kind: &str, index: u32, action: &str, conditional: bool) -> JavaScriptInputFinding {
+        JavaScriptInputFinding {
+            plugin: plugin.into(),
+            source_file: format!("js/plugins/{plugin}.js"),
+            line: 807,
+            pattern: if kind == "keyboard" { "Input.keyMapper" } else { "Input.gamepadMapper" }.into(),
+            category: if kind == "keyboard" { "keyboard_mapping_assignment" } else { "gamepad_mapping_assignment" }.into(),
+            confidence: if conditional { "static_conditional_assignment" } else { "static_assignment" }.into(),
+            action: Some(action.into()),
+            mapper_index: Some(index),
+        }
+    }
+
+    #[test]
+    fn reports_yanfly_conditional_override_without_claiming_runtime_binding() {
+        let core = vec![core_action("pageup", 81, "Q")];
+        let plugins = group_plugin_evidence(Vec::new(), vec![
+            mapping("YEP_ButtonCommonEvents", "keyboard", 81, "q", true),
+        ]);
+        let conflicts = detect_mapping_conflicts(&core, &plugins);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].input_kind, "keyboard");
+        assert_eq!(conflicts[0].input_index, 81);
+        assert_eq!(conflicts[0].core_actions, vec!["pageup"]);
+        assert_eq!(conflicts[0].conflict_types, vec!["potential_core_override"]);
+        assert_eq!(conflicts[0].certainty, "potential_static_evidence");
+        assert_eq!(conflicts[0].plugin_assignments[0].action, "q");
+        assert_eq!(conflicts[0].plugin_assignments[0].confidence, "static_conditional_assignment");
+    }
+
+    #[test]
+    fn identical_mapping_is_not_a_conflict() {
+        let core = vec![core_action("pageup", 81, "Q")];
+        let plugins = group_plugin_evidence(Vec::new(), vec![
+            mapping("PluginA", "keyboard", 81, "pageup", false),
+            mapping("PluginB", "keyboard", 81, "pageup", true),
+        ]);
+        assert!(detect_mapping_conflicts(&core, &plugins).is_empty());
+    }
+
+    #[test]
+    fn detects_two_plugins_assigning_different_actions() {
+        let plugins = group_plugin_evidence(Vec::new(), vec![
+            mapping("PluginA", "keyboard", 82, "r", false),
+            mapping("PluginB", "keyboard", 82, "reload", true),
+        ]);
+        let conflicts = detect_mapping_conflicts(&[], &plugins);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].conflict_types, vec!["potential_plugin_collision"]);
+        assert_eq!(conflicts[0].plugin_assignments.len(), 2);
+    }
+
+    #[test]
+    fn keeps_keyboard_and_gamepad_indices_separate() {
+        let core = vec![core_action("ok", 1, "Unknown key 1")];
+        let plugins = group_plugin_evidence(Vec::new(), vec![
+            mapping("PluginA", "gamepad", 1, "cancel", false),
+            mapping("PluginB", "keyboard", 1, "ok", false),
+        ]);
+        assert!(detect_mapping_conflicts(&core, &plugins).is_empty());
+    }
+
+    #[test]
+    fn detects_gamepad_plugin_collisions_without_core_gamepad_data() {
+        let plugins = group_plugin_evidence(Vec::new(), vec![
+            mapping("PluginA", "gamepad", 0, "ok", false),
+            mapping("PluginB", "gamepad", 0, "attack", false),
+        ]);
+        let conflicts = detect_mapping_conflicts(&[], &plugins);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].input_kind, "gamepad");
+        assert!(conflicts[0].core_actions.is_empty());
+    }
+
+    #[test]
+    fn ignores_unresolved_mapper_accesses() {
+        let mut dynamic = mapping("PluginA", "keyboard", 81, "q", false);
+        dynamic.category = "keyboard_mapping_access".into();
+        let plugins = group_plugin_evidence(Vec::new(), vec![dynamic]);
+        assert!(detect_mapping_conflicts(&[core_action("pageup", 81, "Q")], &plugins).is_empty());
+    }
+
 }
