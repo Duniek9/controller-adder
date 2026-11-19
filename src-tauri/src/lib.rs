@@ -1,5 +1,5 @@
 mod scanner;
-
+mod effective_command;
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
@@ -16,7 +16,8 @@ pub fn run() {
             scanner::input::scan_inputs,
             scanner::plugins::scan_plugins,
             scanner::parameters::scan_parameters,
-            scanner::javascript::scan_javascript
+            scanner::javascript::scan_javascript,
+            effective_command::scan_effective_inputs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
