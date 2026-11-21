@@ -28,13 +28,18 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          version: 10
       - uses: actions/setup-node@v4
         with:
-          node-version: 24
-          cache: pnpm
+          node-version: '24.x'
+          check-latest: true
+      - name: Install pnpm using the selected Node.js
+        run: npm install --global pnpm@10
+      - name: Verify JavaScript toolchain
+        run: |
+          node --version
+          npm --version
+          pnpm --version
+          node -e "if (Number(process.versions.node.split('.')[0]) < 24) process.exit(1)"
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -54,9 +59,7 @@ jobs:
           tar -czf release-assets/controller-cli-linux-x86_64.tar.gz -C target/release controller-cli
           cp target/release/bundle/appimage/*.AppImage release-assets/
           cp target/release/bundle/deb/*.deb release-assets/
-          sha256sum release-assets/* > release-assets/SHA256SUMS-linux-x86_64.txt.tmp
-          sed 's|release-assets/||g' release-assets/SHA256SUMS-linux-x86_64.txt.tmp > release-assets/SHA256SUMS-linux-x86_64.txt
-          rm release-assets/SHA256SUMS-linux-x86_64.txt.tmp
+          (cd release-assets && sha256sum *.tar.gz *.AppImage *.deb > SHA256SUMS-linux-x86_64.txt)
       - name: Collect Windows packages
         if: runner.os == 'Windows'
         shell: pwsh
