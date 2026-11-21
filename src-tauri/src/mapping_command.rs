@@ -21,3 +21,15 @@ pub fn suggest_controller_mapping(
 pub fn validate_controller_mapping(profile: MappingProfile) -> MappingValidation {
     validate_mapping(&profile)
 }
+
+#[tauri::command]
+pub fn export_mapping_profile(profile: MappingProfile) -> Result<String, String> {
+    use controller_core::output::{default_path, write_json, OutputKind};
+    let result = validate_mapping(&profile);
+    if !result.valid {
+        return Err(result.errors.into_iter().map(|e| e.message).collect::<Vec<_>>().join("; "));
+    }
+    let path = default_path(OutputKind::Profile, Path::new(&profile.game_path), "profile")?;
+    write_json(&path, &profile)?;
+    Ok(path.to_string_lossy().into_owned())
+}
