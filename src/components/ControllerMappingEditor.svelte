@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ReportExport from "./ReportExport.svelte";
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
   import { selectedGamePath } from '../lib/stores/selectedGame';
@@ -379,6 +380,10 @@
     <p class="footnote">D-pad directions and stick movement may already work through the engine's built-in handling; these assignments are editable suggestions, not detected runtime mappings. Analog mappings use configurable thresholds and require the future runtime input-handler patch. Saved profiles are local to this app installation; Export JSON for a portable copy.</p>
   {:else}
     <p class="empty">Select a game and scan its actions to begin. A game does not need pre-existing controller support.</p>
+  {/if}
+
+  {#if report && scannedPath === $selectedGamePath.trim()}
+    <ReportExport gamePath={scannedPath} kind="mapping" report={report} />
   {/if}
 </section>
 
