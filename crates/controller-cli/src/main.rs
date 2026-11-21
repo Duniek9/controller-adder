@@ -1,3 +1,5 @@
+mod mapping_command;
+
 use clap::{Parser, Subcommand};
 use controller_core::{
     detect_engine,
@@ -21,6 +23,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Discover, suggest, edit and validate controller profiles.
+    Mapping {
+        #[command(subcommand)]
+        command: mapping_command::MappingCommands,
+    },
     /// Detect the game engine.
     Detect {
         path: PathBuf,
@@ -68,6 +75,7 @@ fn print_json<T: Serialize>(value: &T) -> Result<(), String> {
 
 fn execute(command: Commands) -> Result<(), String> {
     match command {
+        Commands::Mapping { command } => mapping_command::execute(command)?,
         Commands::Detect { path, json } => {
             let engine = detect_engine(&path)?;
             if json {
