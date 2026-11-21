@@ -50,7 +50,7 @@ impl ExportArgs {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Generate standalone controller plugins without installing them.
+    /// Generate or install controller plugins.
     Patch {
         #[command(subcommand)]
         command: PatchCommands,
@@ -112,6 +112,13 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum PatchCommands {
+    /// Install and register the generated plugin for the game in a profile.
+    /// Close the game and its editor before running this command.
+    Apply {
+        profile: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// Generate JavaScript to stdout or a new output file.
     Generate {
         profile: PathBuf,
@@ -123,6 +130,21 @@ enum PatchCommands {
 fn execute_patch(command: PatchCommands) -> Result<(), String> {
     use std::fs;
     match command {
+        PatchCommands::Apply { profile, json } => {
+            let bytes = fs::read(&profile).map_err(|e| format!("Cannot read profile: {e}"))?;
+            let profile: controller_core::mapping::MappingProfile =
+                serde_json::from_slice(&bytes).map_err(|e| format!("Invalid profile: {e}"))?;
+            let report = controller_core::installer::install_plugin(&profile)?;
+            if json {
+                print_json(&report)?;
+            } else {
+                println!("Installed for {}", report.engine);
+                println!("Plugin: {}", report.plugin.display());
+                println!("Registry: {}", report.registry.display());
+                println!("Original registry backup: {}", report.backup.display());
+            }
+            Ok(())
+        }
         PatchCommands::Generate { profile, export } => {
             let bytes = fs::read(&profile).map_err(|e| format!("Cannot read profile: {e}"))?;
             let profile: controller_core::mapping::MappingProfile =
