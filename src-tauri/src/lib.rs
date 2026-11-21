@@ -37,6 +37,8 @@ pub fn run() {
             mapping_command::suggest_controller_mapping,
             mapping_command::validate_controller_mapping,
             mapping_command::export_mapping_profile,
+            mapping_command::import_mapping_profile,
+            mapping_command::profile_import_directory,
             export_scan_report,
         ])
         .run(tauri::generate_context!())
