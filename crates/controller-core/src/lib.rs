@@ -1,5 +1,6 @@
 pub mod engines;
 pub mod mapping;
+pub mod output;
 pub mod patch;
 pub mod scanner;
 
