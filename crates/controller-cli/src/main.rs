@@ -112,6 +112,13 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum PatchCommands {
+    /// Update the installed plugin using a revised profile.
+    /// Close the game and editor before running this command.
+    Update {
+        profile: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect the currently installed controller patch.
     Status {
         path: PathBuf,
@@ -142,6 +149,22 @@ enum PatchCommands {
 fn execute_patch(command: PatchCommands) -> Result<(), String> {
     use std::fs;
     match command {
+        PatchCommands::Update { profile, json } => {
+            let bytes = fs::read(&profile).map_err(|e| format!("Cannot read profile: {e}"))?;
+            let profile: controller_core::mapping::MappingProfile =
+                serde_json::from_slice(&bytes).map_err(|e| format!("Invalid profile: {e}"))?;
+            let report = controller_core::installer::update_plugin(&profile)?;
+            if json { print_json(&report)?; }
+            else {
+                println!("{}", if report.changed { "Controller Adder updated." } else { "Plugin already matches profile; no changes." });
+                println!("Plugin: {}", report.plugin.display());
+                println!("Status: {:?}", report.state);
+                if let Some(backup) = report.previous_plugin_backup {
+                    println!("Previous plugin backup: {}", backup.display());
+                }
+            }
+            Ok(())
+        }
         PatchCommands::Status { path, json } => {
             let report = controller_core::installer::patch_status(&path)?;
             if json { print_json(&report)?; }
