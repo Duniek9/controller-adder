@@ -61,3 +61,17 @@ pub fn profile_import_directory() -> Result<Option<String>, String> {
     let directory = controller_core::output::output_root()?.join("profiles");
     Ok(directory.is_dir().then(|| directory.to_string_lossy().into_owned()))
 }
+
+#[tauri::command]
+pub fn export_mapping_profile_as(profile: MappingProfile, file_path: String) -> Result<String, String> {
+    let result = validate_mapping(&profile);
+    if !result.valid {
+        return Err(result.errors.into_iter().map(|e| e.message).collect::<Vec<_>>().join("; "));
+    }
+    let path = Path::new(&file_path);
+    if path.extension().and_then(|e| e.to_str()).map_or(true, |e| !e.eq_ignore_ascii_case("json")) {
+        return Err("Choose a .json filename".into());
+    }
+    controller_core::output::write_json(path, &profile)?;
+    Ok(file_path)
+}
