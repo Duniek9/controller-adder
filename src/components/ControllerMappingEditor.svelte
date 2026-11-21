@@ -2,6 +2,7 @@
   import ReportExport from "./ReportExport.svelte";
   import { invoke } from '@tauri-apps/api/core';
   import { onMount } from 'svelte';
+  import { open, save as chooseSavePath } from '@tauri-apps/plugin-dialog';
   import { selectedGamePath } from '../lib/stores/selectedGame';
 
   type MappingCatalog = {
@@ -70,6 +71,7 @@
   const storagePrefix = 'controller-adder:gamepad-profile:v1:';
 
   let report: MappingCatalog | null = null;
+  let importedFile = '';
   let validation: Validation | null = null;
   let validationId = 0;
   let busy = false;
@@ -88,8 +90,8 @@
     return storagePrefix + gamePath;
   }
 
-  function uniqueOptions(input: MappingCatalog): ActionOption[] {
-    return input.actions.map((id) => {
+  function uniqueOptions(input: MappingCatalog, currentBindings: Bindings): ActionOption[] {
+    return [...new Set([...input.actions, ...Object.keys(currentBindings)])].map((id) => {
       const evidence = input.evidence[id] ?? 'unresolved';
       const kind: ActionOption['kind'] = evidence === 'core' ? 'core'
         : evidence === 'unresolved' ? 'unresolved' : 'plugin';
@@ -131,6 +133,7 @@
     error = '';
     notice = '';
     report = null;
+    importedFile = '';
     bindings = {};
     try {
       const found = await invoke<MappingCatalog>('scan_mapping_actions', { gamePath: path });
@@ -221,6 +224,61 @@
     }
   }
 
+  async function importProfile() {
+    const catalog = report;
+    if (!catalog || busy || loading) return;
+    const current = requestId;
+    busy = true;
+    error = '';
+    try {
+      const directory = await invoke<string | null>('profile_import_directory');
+      const selected = await open({
+        directory: false, multiple: false,
+        title: 'Import controller profile',
+        filters: [{ name: 'Controller profile (JSON)', extensions: ['json'] }],
+        ...(directory ? { defaultPath: directory } : {})
+      });
+      if (typeof selected !== 'string' || current !== requestId || report !== catalog) return;
+      const profile = await invoke<Profile>('import_mapping_profile', {
+        filePath: selected, gamePath: catalog.game_path, engine: catalog.engine
+      });
+      if (current !== requestId || report !== catalog || scannedPath !== $selectedGamePath.trim()) return;
+      if (Object.keys(bindings).length && !confirm('Replace the current controller bindings with this imported profile?')) return;
+      bindings = Object.assign(Object.create(null), profile.bindings);
+      importedFile = selected;
+      dirty = true;
+      suggestionWarnings = Object.keys(bindings).filter(action => !catalog.actions.includes(action))
+        .map(action => action + ': imported action not found in current scan; review before applying.');
+      filter = '';
+      notice = 'Imported ' + selected + '. Review, save locally or export the revised profile. No game files changed.';
+    } catch (cause) {
+      if (current === requestId) error = 'Could not import profile: ' + String(cause);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function exportProfileAs() {
+    const profile = createProfile();
+    if (!profile || busy) return;
+    const current = requestId;
+    busy = true;
+    error = '';
+    try {
+      const directory = await invoke<string | null>('profile_import_directory');
+      const path = await chooseSavePath({
+        title: 'Export revised controller profile',
+        filters: [{ name: 'Controller profile (JSON)', extensions: ['json'] }],
+        ...(directory ? { defaultPath: directory + '/revised-profile.json' } : {})
+      });
+      if (!path || current !== requestId) return;
+      const written = await invoke<string>('export_mapping_profile_as', { profile, filePath: path });
+      if (current === requestId) notice = 'JSON saved: ' + written;
+    } catch (cause) {
+      if (current === requestId) error = 'Could not export profile: ' + String(cause);
+    } finally { busy = false; }
+  }
+
   async function exportProfile() {
     const profile = createProfile();
     if (!profile || busy) return;
@@ -240,7 +298,7 @@
 
   onMount(() => { storageReady = typeof localStorage !== 'undefined'; });
 
-  $: options = report ? uniqueOptions(report) : [];
+  $: options = report ? uniqueOptions(report, bindings) : [];
   $: visibleOptions = options.filter((item) =>
     `${item.id} ${item.evidence}`.toLowerCase().includes(filter.trim().toLowerCase())
   );
@@ -295,6 +353,7 @@
       <span><strong>{report.engine}</strong></span>
       <span>{options.length} actions discovered</span>
       <span>{assigned} assigned</span>
+      {#if importedFile}<span>Imported: {importedFile}</span>{/if}
       <span>{dirty ? 'Unsaved changes' : 'No unsaved changes'}</span>
     </div>
 
@@ -320,7 +379,9 @@
       <button type="button" class="secondary" disabled={busy || !validation?.valid} on:click={() => applySuggestions('automatic')}>Auto-assign plugin actions</button>
       <button type="button" class="secondary" disabled={busy || !validation?.valid} on:click={() => applySuggestions('conservative')}>Fill standard defaults</button>
       <button type="button" disabled={busy || !validation?.valid} on:click={save}>Save profile locally</button>
+      <button type="button" class="secondary" disabled={busy || loading} on:click={importProfile}>Import JSON</button>
       <button type="button" class="secondary" disabled={busy || !validation?.valid} on:click={exportProfile}>Export JSON</button>
+      <button type="button" class="secondary" disabled={busy || !validation?.valid} on:click={exportProfileAs}>Export JSON as…</button>
     </div>
 
     <div class="rows">
