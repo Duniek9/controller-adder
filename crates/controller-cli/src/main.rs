@@ -112,6 +112,18 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum PatchCommands {
+    /// Inspect the currently installed controller patch.
+    Status {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a recognized controller patch. Close the game and editor first.
+    Uninstall {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// Install and register the generated plugin for the game in a profile.
     /// Close the game and its editor before running this command.
     Apply {
@@ -130,6 +142,28 @@ enum PatchCommands {
 fn execute_patch(command: PatchCommands) -> Result<(), String> {
     use std::fs;
     match command {
+        PatchCommands::Status { path, json } => {
+            let report = controller_core::installer::patch_status(&path)?;
+            if json { print_json(&report)?; }
+            else {
+                println!("Status: {:?}", report.state);
+                println!("Engine: {}", report.engine);
+                println!("{}", report.detail);
+                println!("Plugin: {}", report.plugin.display());
+            }
+            Ok(())
+        }
+        PatchCommands::Uninstall { path, json } => {
+            let report = controller_core::installer::uninstall_plugin(&path)?;
+            if json { print_json(&report)?; }
+            else {
+                println!("Controller Adder uninstalled.");
+                println!("Registry: {}", report.registry.display());
+                println!("Original backup archive: {}", report.original_backup_archive.display());
+                println!("Pre-uninstall backup: {}", report.pre_uninstall_backup.display());
+            }
+            Ok(())
+        }
         PatchCommands::Apply { profile, json } => {
             let bytes = fs::read(&profile).map_err(|e| format!("Cannot read profile: {e}"))?;
             let profile: controller_core::mapping::MappingProfile =
