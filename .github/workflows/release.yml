@@ -1,0 +1,98 @@
+name: Build and publish alpha
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*-alpha*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: controller-adder-alpha
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+            bundles: appimage,deb
+          - os: windows-latest
+            platform: windows-x86_64
+            bundles: nsis
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libxdo-dev libssl-dev
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: cargo test -p controller-core -p controller-cli --locked
+      - run: cargo build -p controller-cli --release --locked
+      - run: pnpm tauri build --bundles "${{ matrix.bundles }}"
+      - name: Collect Linux packages
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p release-assets
+          tar -czf release-assets/controller-cli-linux-x86_64.tar.gz -C target/release controller-cli
+          cp target/release/bundle/appimage/*.AppImage release-assets/
+          cp target/release/bundle/deb/*.deb release-assets/
+          sha256sum release-assets/* > release-assets/SHA256SUMS-linux-x86_64.txt.tmp
+          sed 's|release-assets/||g' release-assets/SHA256SUMS-linux-x86_64.txt.tmp > release-assets/SHA256SUMS-linux-x86_64.txt
+          rm release-assets/SHA256SUMS-linux-x86_64.txt.tmp
+      - name: Collect Windows packages
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path release-assets -Force | Out-Null
+          Compress-Archive -Path target/release/controller-cli.exe -DestinationPath release-assets/controller-cli-windows-x86_64.zip
+          Copy-Item target/release/bundle/nsis/*-setup.exe release-assets/
+          if (!(Get-ChildItem release-assets/*-setup.exe)) { throw 'Missing NSIS installer' }
+          Get-ChildItem release-assets -File | ForEach-Object {
+            $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+            "$hash  $($_.Name)"
+          } | Set-Content release-assets/SHA256SUMS-windows-x86_64.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: release-assets/
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v') && contains(github.ref_name, '-alpha')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          gh release create "$RELEASE_TAG" release-assets/* --verify-tag --prerelease --title "Controller Adder $RELEASE_TAG" --notes "Early alpha with RPG Maker MV/MZ controller mapping and patch management. Linux and Windows x86-64 builds. Windows and broader game compatibility are not yet fully tested. Back up game files before patching and report issues on GitHub."
