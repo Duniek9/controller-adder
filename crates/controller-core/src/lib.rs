@@ -1,4 +1,5 @@
 pub mod engines;
+pub mod mapping;
 pub mod scanner;
 
 use std::path::Path;
