@@ -1,6 +1,7 @@
 mod scanner;
 mod effective_command;
 mod mapping_command;
+
 #[tauri::command]
 fn greet(name: &str) -> String {
     format!("Hello, {}! You've been greeted from Rust!", name)
@@ -22,6 +23,7 @@ pub fn run() {
             mapping_command::scan_mapping_actions,
             mapping_command::suggest_controller_mapping,
             mapping_command::validate_controller_mapping,
+            mapping_command::export_mapping_profile,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
