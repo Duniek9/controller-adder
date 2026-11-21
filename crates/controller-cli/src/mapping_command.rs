@@ -1,6 +1,6 @@
 use clap::{Subcommand, ValueEnum};
 use controller_core::mapping::{
-    scan_actions, fill_suggestions, validate_mapping, set_binding, remove_binding, MappingProfile, SuggestionMode,
+    scan_actions, fill_suggestions, validate_mapping, edit_binding, remove_binding, MappingProfile, SuggestionMode, PhysicalInput, Direction,
 };
 use std::{fs, path::{Path, PathBuf}};
 
@@ -9,6 +9,9 @@ pub enum Mode {
     Conservative,
     Automatic,
 }
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AxisDirection { Negative, Positive }
 
 #[derive(Debug, Subcommand)]
 pub enum MappingCommands {
@@ -30,8 +33,17 @@ pub enum MappingCommands {
         profile: PathBuf,
         #[arg(long)]
         action: String,
+        #[arg(long, conflicts_with = "axis", required_unless_present = "axis")]
+        button: Option<u32>,
+        #[arg(long, requires = "direction", conflicts_with = "button")]
+        axis: Option<u32>,
+        #[arg(long, value_enum, requires = "axis")]
+        direction: Option<AxisDirection>,
+        #[arg(long, requires = "axis")]
+        threshold: Option<f64>,
+        /// Add another input instead of replacing the action's inputs.
         #[arg(long)]
-        button: u32,
+        append: bool,
     },
     /// Remove an exact, case-sensitive action binding.
     Remove {
@@ -99,9 +111,19 @@ pub fn execute(command: MappingCommands) -> Result<(), String> {
             if let Some(output) = output { save(&output, &result.profile, false)?; }
             super::print_json(&result)
         }
-        MappingCommands::Set { profile, action, button } => {
+        MappingCommands::Set { profile, action, button, axis, direction, threshold, append } => {
             let mut data = load(&profile)?;
-            set_binding(&mut data, action, button)?;
+            let input = match (button, axis, direction) {
+                (Some(index), None, None) => PhysicalInput::Button { index },
+                (None, Some(index), Some(direction)) => PhysicalInput::Axis {
+                    index, direction: match direction {
+                        AxisDirection::Negative => Direction::Negative,
+                        AxisDirection::Positive => Direction::Positive,
+                    }, threshold: threshold.unwrap_or(0.5),
+                },
+                _ => return Err("Specify a button or an axis and direction".into()),
+            };
+            edit_binding(&mut data, action, input, append)?;
             save(&profile, &data, true)?;
             super::print_json(&data)
         }
