@@ -1,4 +1,5 @@
 <script lang="ts">
+  import ReportExport from "./ReportExport.svelte";
   import { invoke } from '@tauri-apps/api/core';
   import { selectedGamePath } from '../lib/stores/selectedGame';
 
@@ -42,6 +43,7 @@
 
 
   let report: EffectiveReport | null = null;
+  let reportPath = '';
   let error = '';
   let loading = false;
   let query = '';
@@ -96,6 +98,7 @@
       if (result.schema_version !== 2) {
         throw new Error(`Unsupported effective-input schema ${result.schema_version}; expected 2.`);
       }
+      reportPath = path;
       report = result;
     } catch (cause) {
       if (thisRequest === requestCounter) {
@@ -233,6 +236,10 @@
         {/each}
       </div>
     </div>
+  {/if}
+
+  {#if report && reportPath === $selectedGamePath.trim()}
+    <ReportExport gamePath={reportPath} kind="effective" report={report} />
   {/if}
 </section>
 
