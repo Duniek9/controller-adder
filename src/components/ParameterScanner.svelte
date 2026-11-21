@@ -1,5 +1,6 @@
 
 <script lang="ts">
+  import ReportExport from "./ReportExport.svelte";
   import { invoke } from '@tauri-apps/api/core';
 
   type InputEvidence = {
@@ -18,6 +19,7 @@
 
   let evidence = $state<InputEvidence[]>([]);
   let isScanning = $state(false);
+  let reportPath = $state('');
   let error = $state<string | null>(null);
 
   let filter = $state('all');
@@ -83,6 +85,7 @@
         );
 
         if (!cancelled) {
+          reportPath = path;
           evidence = result;
         }
       } catch (err) {
@@ -214,6 +217,10 @@
       configurations. They are not confirmed runtime
       mappings.
     </p>
+  {/if}
+
+  {#if !isScanning && !error && reportPath === gamePath}
+    <ReportExport {gamePath} kind="parameters" report={evidence} />
   {/if}
 </section>
 
