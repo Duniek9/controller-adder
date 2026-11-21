@@ -1,5 +1,6 @@
 
 <script lang="ts">
+  import ReportExport from "./ReportExport.svelte";
   import { invoke } from '@tauri-apps/api/core';
 
 
@@ -13,6 +14,7 @@ let { gamePath, onEngineDetected }: Props = $props();
 
   let engine = $state<string | null>(null);
   let isScanning = $state(false);
+  let reportPath = $state('');
   let error = $state<string | null>(null);
 
   $effect(() => {
@@ -34,6 +36,7 @@ let { gamePath, onEngineDetected }: Props = $props();
         );
 
         if (!cancelled) {
+          reportPath = path;
           engine = detected;
           onEngineDetected?.(detected)
         }
@@ -83,6 +86,10 @@ let { gamePath, onEngineDetected }: Props = $props();
 
   {#if error}
     <p class="error">{error}</p>
+  {/if}
+
+  {#if !isScanning && !error && reportPath === gamePath && engine}
+    <ReportExport {gamePath} kind="detect" report={{ path: gamePath, engine }} />
   {/if}
 </section>
 

@@ -1,4 +1,6 @@
 use clap::{Subcommand, ValueEnum};
+use super::ExportArgs;
+use controller_core::output::{OutputKind, write_json};
 use controller_core::mapping::{
     scan_actions, fill_suggestions, validate_mapping, edit_binding, remove_binding, MappingProfile, SuggestionMode, PhysicalInput, Direction,
 };
@@ -16,12 +18,16 @@ pub enum AxisDirection { Negative, Positive }
 #[derive(Debug, Subcommand)]
 pub enum MappingCommands {
     /// List discovered actions, including unresolved custom actions.
-    Scan { path: PathBuf },
+    Scan {
+        path: PathBuf,
+        #[command(flatten)]
+        export: ExportArgs,
+    },
     /// Generate conservative standard bindings; custom actions remain unassigned.
     Suggest {
         path: PathBuf,
-        #[arg(long)]
-        output: Option<PathBuf>,
+        #[command(flatten)]
+        export: ExportArgs,
         #[arg(long, value_enum, default_value = "automatic")]
         mode: Mode,
         /// Fill a previously exported profile without overwriting its bindings.
@@ -99,8 +105,12 @@ fn save(path: &Path, profile: &MappingProfile, overwrite: bool) -> Result<(), St
 
 pub fn execute(command: MappingCommands) -> Result<(), String> {
     match command {
-        MappingCommands::Scan { path } => super::print_json(&scan_actions(&path)?),
-        MappingCommands::Suggest { path, output, mode, existing } => {
+        MappingCommands::Scan { path, export } => {
+            let catalog = scan_actions(&path)?;
+            export.report(&path, "mapping", &catalog)?;
+            super::print_json(&catalog)
+        },
+        MappingCommands::Suggest { path, export, mode, existing } => {
             let catalog = scan_actions(&path)?;
             let existing = existing.as_deref().map(load).transpose()?;
             let mode = match mode {
@@ -108,7 +118,10 @@ pub fn execute(command: MappingCommands) -> Result<(), String> {
                 Mode::Automatic => SuggestionMode::Automatic,
             };
             let result = fill_suggestions(&catalog, existing, mode)?;
-            if let Some(output) = output { save(&output, &result.profile, false)?; }
+            if let Some(output) = export.destination(OutputKind::Profile, &path, "profile")? {
+                write_json(&output, &result.profile)?;
+                eprintln!("Saved {}", output.display());
+            }
             super::print_json(&result)
         }
         MappingCommands::Set { profile, action, button, axis, direction, threshold, append } => {

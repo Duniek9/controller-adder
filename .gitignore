@@ -14,7 +14,8 @@ build/
 .env.*
 !.env.example
 
-# Generated reports
+# Generated reports, profiles and patches
+/output/
 resolution-report-*.json
 
 # Editor and temporary files

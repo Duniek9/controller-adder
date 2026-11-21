@@ -1,5 +1,6 @@
 
 <script lang="ts">
+  import ReportExport from "./ReportExport.svelte";
   import { invoke } from '@tauri-apps/api/core';
 
   type PluginInfo = {
@@ -17,6 +18,7 @@
 
   let plugins = $state<PluginInfo[]>([]);
   let isScanning = $state(false);
+  let reportPath = $state('');
   let error = $state<string | null>(null);
   let showEnabledOnly = $state(false);
 
@@ -47,6 +49,7 @@
         );
 
         if (!cancelled) {
+          reportPath = path;
           plugins = result;
         }
       } catch (err) {
@@ -133,6 +136,10 @@
         {/each}
       </div>
     {/if}
+  {/if}
+
+  {#if !isScanning && !error && reportPath === gamePath}
+    <ReportExport {gamePath} kind="plugins" report={plugins} />
   {/if}
 </section>
 
