@@ -17,11 +17,13 @@
   };
   type Suggestion = { profile: Profile; unassigned: string[]; added: string[]; warnings: string[] };
   type ActionOption = { id: string; kind: 'core' | 'plugin' | 'unresolved'; evidence: string };
+  type PhysicalInput = { kind: 'button'; index: number } | { kind: 'axis'; index: number; direction: 'negative' | 'positive'; threshold: number };
+  type Bindings = Record<string, PhysicalInput[]>;
   type Profile = {
-    format_version: 1;
+    format_version: 2;
     engine: string;
     game_path: string;
-    bindings: Record<string, number>;
+    bindings: Bindings;
   };
 
   const buttons = [
@@ -42,6 +44,28 @@
     { index: 14, label: 'D-pad left' },
     { index: 15, label: 'D-pad right' }
   ];
+  const axisOptions = [
+    { index: 0, direction: 'negative', label: 'Left stick left' },
+    { index: 0, direction: 'positive', label: 'Left stick right' },
+    { index: 1, direction: 'negative', label: 'Left stick up' },
+    { index: 1, direction: 'positive', label: 'Left stick down' },
+    { index: 2, direction: 'negative', label: 'Right stick left' },
+    { index: 2, direction: 'positive', label: 'Right stick right' },
+    { index: 3, direction: 'negative', label: 'Right stick up' },
+    { index: 3, direction: 'positive', label: 'Right stick down' }
+  ] as const;
+
+  function inputKey(input: PhysicalInput): string {
+    return input.kind === 'button' ? `button:${input.index}` : `axis:${input.index}:${input.direction}`;
+  }
+
+  function parseInput(value: string): PhysicalInput | null {
+    const button = buttons.find((b) => value === `button:${b.index}`);
+    if (button) return { kind: 'button', index: button.index };
+    const axis = axisOptions.find((a) => value === `axis:${a.index}:${a.direction}`);
+    return axis ? { kind: 'axis', index: axis.index, direction: axis.direction, threshold: 0.5 } : null;
+  }
+
   const storagePrefix = 'controller-adder:gamepad-profile:v1:';
 
   let report: MappingCatalog | null = null;
@@ -54,7 +78,7 @@
   let notice = '';
   let loading = false;
   let filter = '';
-  let bindings: Record<string, number> = {};
+  let bindings: Bindings = {};
   let dirty = false;
   let requestId = 0;
   let storageReady = false;
@@ -75,20 +99,19 @@
     });
   }
 
-  function readProfile(gamePath: string, engine: string): Record<string, number> {
+  function readProfile(gamePath: string, engine: string): Bindings {
     if (!storageReady) return {};
     const raw = localStorage.getItem(profileKey(gamePath));
     if (!raw) return {};
     try {
-      const value: unknown = JSON.parse(raw);
-      if (!value || typeof value !== 'object') return {};
-      const profile = value as Partial<Profile>;
-      if (profile.format_version !== 1 || profile.engine !== engine || !profile.bindings ||
-          typeof profile.bindings !== 'object' || Array.isArray(profile.bindings)) return {};
-      const restored: Record<string, number> = {};
+      const profile = JSON.parse(raw);
+      if (![1, 2].includes(profile.format_version) || profile.engine !== engine ||
+          !profile.bindings || typeof profile.bindings !== 'object' || Array.isArray(profile.bindings)) return {};
+      if (profile.format_version === 2) return profile.bindings as Bindings;
+      const restored: Bindings = Object.create(null);
       for (const [action, button] of Object.entries(profile.bindings)) {
         if (typeof button === 'number' && Number.isInteger(button) && button >= 0) {
-          restored[action] = button;
+          restored[action] = [{ kind: 'button', index: button }];
         }
       }
       return restored;
@@ -126,11 +149,25 @@
     }
   }
 
-  function changeButton(action: string, value: string) {
+  function changeInput(action: string, slot: number, value: string) {
+    const current = [...(bindings[action] ?? [])];
+    const input = parseInput(value);
+    if (input) current[slot] = input;
+    else current.splice(slot, 1);
     const updated = { ...bindings };
-    if (value === '') delete updated[action];
-    else updated[action] = Number(value);
+    if (current.length) updated[action] = current;
+    else delete updated[action];
     bindings = updated;
+    dirty = true;
+    notice = '';
+  }
+
+  function changeThreshold(action: string, slot: number, threshold: number) {
+    const current = [...(bindings[action] ?? [])];
+    const input = current[slot];
+    if (!input || input.kind !== 'axis' || !Number.isFinite(threshold)) return;
+    current[slot] = { ...input, threshold };
+    bindings = { ...bindings, [action]: current };
     dirty = true;
     notice = '';
   }
@@ -159,7 +196,7 @@
   function createProfile(): Profile | null {
     if (!report) return null;
     return {
-      format_version: 1,
+      format_version: 2,
       engine: report.engine,
       game_path: report.game_path,
       bindings: { ...bindings }
@@ -210,13 +247,13 @@
     `${item.id} ${item.evidence}`.toLowerCase().includes(filter.trim().toLowerCase())
   );
   $: assigned = Object.keys(bindings).length;
-  async function refreshValidation(catalog: MappingCatalog | null, currentBindings: Record<string, number>) {
+  async function refreshValidation(catalog: MappingCatalog | null, currentBindings: Bindings) {
     const id = ++validationId;
     validation = null;
     if (!catalog) return;
     try {
       const result = await invoke<Validation>('validate_controller_mapping', {
-        profile: { format_version: 1, engine: catalog.engine, game_path: catalog.game_path, bindings: currentBindings }
+        profile: { format_version: 2, engine: catalog.engine, game_path: catalog.game_path, bindings: currentBindings }
       });
       if (id === validationId) validation = result;
     } catch (cause) {
@@ -238,7 +275,7 @@
 <section class="mapping-editor">
   <header>
     <h1>Controller Mapping Editor</h1>
-    <p>Assign gamepad buttons to engine and plugin actions. Profiles are drafts only; nothing is patched into the game.</p>
+    <p>Assign gamepad buttons and stick directions to engine and plugin actions. Profiles are drafts only; nothing is patched into the game.</p>
   </header>
 
   <form class="scan-panel" on:submit|preventDefault={scan}>
@@ -296,23 +333,53 @@
             <span class="kind">{item.kind}</span>
             <small>{item.evidence}</small>
           </div>
-          <label>
-            <span class="sr-only">Gamepad button for {item.id}</span>
-            <select disabled={busy} value={item.id in bindings ? String(bindings[item.id]) : ''}
-              on:change={(event) => changeButton(item.id, event.currentTarget.value)}>
-              <option value="">Unassigned</option>
-              {#each buttons as button}
-                <option value={button.index}>{button.index} — {button.label}</option>
-              {/each}
-            </select>
-          </label>
+          <div class="input-list">
+            {#each bindings[item.id] ?? [] as input, slot}
+              <div class="input-row">
+                <label>
+                  <span class="sr-only">Input {slot + 1} for {item.id}</span>
+                  <select disabled={busy} value={inputKey(input)}
+                    on:change={(event) => changeInput(item.id, slot, event.currentTarget.value)}>
+                    <option value="">Remove input</option>
+                    {#each buttons as button}
+                      <option value={`button:${button.index}`}>{button.label}</option>
+                    {/each}
+                    {#each axisOptions as axis}
+                      <option value={`axis:${axis.index}:${axis.direction}`}>{axis.label}</option>
+                    {/each}
+                  </select>
+                </label>
+                {#if input.kind === 'axis'}
+                  <label class="threshold">Threshold
+                    <input type="number" min="0.05" max="1" step="0.05" value={input.threshold}
+                      disabled={busy} on:change={(event) => changeThreshold(item.id, slot, event.currentTarget.valueAsNumber)} />
+                  </label>
+                {/if}
+              </div>
+            {/each}
+            <label>
+              <span class="sr-only">Add input for {item.id}</span>
+              <select disabled={busy} value="" on:change={(event) => {
+                changeInput(item.id, (bindings[item.id] ?? []).length, event.currentTarget.value);
+                event.currentTarget.value = '';
+              }}>
+                <option value="">+ Add input</option>
+                {#each buttons as button}
+                  <option value={`button:${button.index}`}>{button.label}</option>
+                {/each}
+                {#each axisOptions as axis}
+                  <option value={`axis:${axis.index}:${axis.direction}`}>{axis.label}</option>
+                {/each}
+              </select>
+            </label>
+          </div>
         </div>
       {:else}
         <p>No actions match your search.</p>
       {/each}
     </div>
 
-    <p class="footnote">D-pad directions and stick movement may already work through the engine's built-in handling; these assignments are editable suggestions, not detected runtime mappings. Triggers and nonstandard controllers may require a future input-handler extension. Saved profiles are local to this app installation; Export JSON for a portable copy.</p>
+    <p class="footnote">D-pad directions and stick movement may already work through the engine's built-in handling; these assignments are editable suggestions, not detected runtime mappings. Analog mappings use configurable thresholds and require the future runtime input-handler patch. Saved profiles are local to this app installation; Export JSON for a portable copy.</p>
   {:else}
     <p class="empty">Select a game and scan its actions to begin. A game does not need pre-existing controller support.</p>
   {/if}
@@ -341,6 +408,10 @@
   .action-info { display:flex; align-items:center; flex-wrap:wrap; column-gap:.5rem; row-gap:.3rem; }
   .action-info small { flex-basis:100%; opacity:.7; }
   .kind { border-radius:1rem; padding:.15rem .5rem; font-size:.75rem; background:#7774; }
+  .input-list { display:grid; gap:.4rem; }
+  .input-row { display:flex; gap:.4rem; align-items:center; flex-wrap:wrap; }
+  .threshold { display:flex; align-items:center; gap:.3rem; font-size:.8rem; }
+  .threshold input { width:5rem; }
   .action-row select { min-width:220px; max-width:100%; }
   .warning { border-color:#d9a04a88; background:#d9a04a0c; }
   .warning p { margin:.4rem 0; }
