@@ -1,6 +1,7 @@
 mod mapping_command;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use controller_core::output::{default_path, write_json, write_new, OutputKind};
 use controller_core::{
     detect_engine,
     scanner::{
@@ -21,6 +22,32 @@ struct Cli {
     command: Commands,
 }
 
+#[derive(Debug, Args)]
+pub struct ExportArgs {
+    /// Save in the default output directory.
+    #[arg(long, conflicts_with = "output")]
+    pub save: bool,
+    /// Write to a custom file without overwriting.
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+}
+
+impl ExportArgs {
+    pub fn destination(&self, kind: OutputKind, game: &std::path::Path, label: &str) -> Result<Option<PathBuf>, String> {
+        if let Some(path) = &self.output { return Ok(Some(path.clone())); }
+        if self.save { return default_path(kind, game, label).map(Some); }
+        Ok(None)
+    }
+
+    pub fn report<T: Serialize>(&self, game: &std::path::Path, label: &str, value: &T) -> Result<(), String> {
+        if let Some(path) = self.destination(OutputKind::Scan, game, label)? {
+            write_json(&path, value)?;
+            eprintln!("Saved {}", path.display());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Generate standalone controller plugins without installing them.
@@ -38,36 +65,48 @@ enum Commands {
         path: PathBuf,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        export: ExportArgs,
     },
     /// Scan engine input defaults.
     Inputs {
         path: PathBuf,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        export: ExportArgs,
     },
     /// Scan plugin registry entries.
     Plugins {
         path: PathBuf,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        export: ExportArgs,
     },
     /// Scan enabled plugin JavaScript for input-related code.
     Javascript {
         path: PathBuf,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        export: ExportArgs,
     },
     /// Build a conservative keyboard/gamepad input inventory for the GUI.
     Effective {
         path: PathBuf,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        export: ExportArgs,
     },
     /// Combine scanner evidence into a report and action catalog.
     Resolve {
         path: PathBuf,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        export: ExportArgs,
     },
 }
 
@@ -76,27 +115,21 @@ enum PatchCommands {
     /// Generate JavaScript to stdout or a new output file.
     Generate {
         profile: PathBuf,
-        #[arg(long)]
-        output: Option<PathBuf>,
+        #[command(flatten)]
+        export: ExportArgs,
     },
 }
 
 fn execute_patch(command: PatchCommands) -> Result<(), String> {
-    use std::{fs, io::Write};
+    use std::fs;
     match command {
-        PatchCommands::Generate { profile, output } => {
+        PatchCommands::Generate { profile, export } => {
             let bytes = fs::read(&profile).map_err(|e| format!("Cannot read profile: {e}"))?;
             let profile: controller_core::mapping::MappingProfile =
                 serde_json::from_slice(&bytes).map_err(|e| format!("Invalid profile: {e}"))?;
             let plugin = controller_core::patch::generate_plugin(&profile)?;
-            if let Some(path) = output {
-                let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path)
-                    .map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
-                if let Err(e) = file.write_all(plugin.as_bytes()).and_then(|_| file.sync_all()) {
-                    drop(file);
-                    let _ = fs::remove_file(&path);
-                    return Err(format!("Cannot write plugin: {e}"));
-                }
+            if let Some(path) = export.destination(OutputKind::Patch, std::path::Path::new(&profile.game_path), "patch")? {
+                write_new(&path, plugin.as_bytes())?;
                 eprintln!("Generated {}", path.display());
             } else {
                 print!("{plugin}");
@@ -117,8 +150,9 @@ fn execute(command: Commands) -> Result<(), String> {
     match command {
         Commands::Patch { command } => execute_patch(command)?,
         Commands::Mapping { command } => mapping_command::execute(command)?,
-        Commands::Detect { path, json } => {
+        Commands::Detect { path, json, export } => {
             let engine = detect_engine(&path)?;
+            export.report(&path, "detect", &serde_json::json!({"path": path, "engine": engine}))?;
             if json {
                 print_json(&serde_json::json!({
                     "path": path,
@@ -128,22 +162,25 @@ fn execute(command: Commands) -> Result<(), String> {
                 println!("Engine: {engine}");
             }
         }
-        Commands::Inputs { path, json } => {
+        Commands::Inputs { path, json, export } => {
             let actions = scan_inputs(path.to_string_lossy().into_owned())?;
+            export.report(&path, "inputs", &actions)?;
             if !json {
                 println!("Detected {} core input actions", actions.len());
             }
             print_json(&actions)?;
         }
-        Commands::Plugins { path, json } => {
+        Commands::Plugins { path, json, export } => {
             let plugins = scan_plugins(path.to_string_lossy().into_owned())?;
+            export.report(&path, "plugins", &plugins)?;
             if !json {
                 println!("Plugin scan result:");
             }
             print_json(&plugins)?;
         }
-        Commands::Javascript { path, json } => {
+        Commands::Javascript { path, json, export } => {
             let report = scan_javascript(&path)?;
+            export.report(&path, "javascript", &report)?;
             if !json {
                 println!(
                     "Scanned {} plugins, found {} JavaScript references ({} skipped)",
@@ -154,8 +191,9 @@ fn execute(command: Commands) -> Result<(), String> {
             }
             print_json(&report)?;
         }
-        Commands::Effective { path, json } => {
+        Commands::Effective { path, json, export } => {
             let report = analyze_effective_inputs(&path)?;
+            export.report(&path, "effective", &report)?;
             if json {
                 print_json(&report)?;
             } else {
@@ -179,8 +217,9 @@ fn execute(command: Commands) -> Result<(), String> {
                 }
             }
         }
-        Commands::Resolve { path, json } => {
+        Commands::Resolve { path, json, export } => {
             let report = resolve_inputs(&path)?;
+            export.report(&path, "resolve", &report)?;
             if json {
                 // The report already contains all fields, including
                 // action_catalog and any new mapper evidence.
