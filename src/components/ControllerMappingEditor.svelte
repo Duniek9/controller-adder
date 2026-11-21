@@ -71,6 +71,17 @@
   const storagePrefix = 'controller-adder:gamepad-profile:v1:';
 
   let report: MappingCatalog | null = null;
+  type PatchState = 'not_installed' | 'installed' | 'disabled' | 'incomplete' | 'conflict';
+  type PatchStatus = { engine: string; state: PatchState; plugin: string; registry: string; backup: string; detail: string };
+  const patchLabels: Record<PatchState, string> = {
+    not_installed: 'Not installed', installed: 'Installed', disabled: 'Disabled',
+    incomplete: 'Incomplete', conflict: 'Conflict'
+  };
+  let patchStatus: PatchStatus | null = null;
+  let patchError = '';
+  let patchNotice = '';
+  let patchChecking = false;
+  let patchRequest = 0;
   let importedFile = '';
   let validation: Validation | null = null;
   let validationId = 0;
@@ -207,6 +218,71 @@
     };
   }
 
+  async function refreshPatchStatus(catalog: MappingCatalog | null) {
+    const id = ++patchRequest;
+    patchStatus = null;
+    patchError = '';
+    patchChecking = !!catalog;
+    if (!catalog) return;
+    try {
+      const result = await invoke<PatchStatus>('controller_patch_status', { gamePath: catalog.game_path });
+      if (id === patchRequest && report === catalog) patchStatus = result;
+    } catch (cause) {
+      if (id === patchRequest) patchError = String(cause);
+    } finally {
+      if (id === patchRequest) patchChecking = false;
+    }
+  }
+
+  async function managePatch(operation: 'install' | 'update' | 'uninstall') {
+    const catalog = report;
+    const profile = createProfile();
+    if (!catalog || !profile || busy || patchChecking || !patchStatus ||
+        scannedPath !== $selectedGamePath.trim()) return;
+    const installed = patchStatus.state === 'installed' || patchStatus.state === 'disabled';
+    if (operation === 'install' && patchStatus.state !== 'not_installed') return;
+    if (operation !== 'install' && !installed) return;
+    if (operation !== 'uninstall' && (!validation?.valid || !Object.keys(profile.bindings).length)) return;
+    const action = operation === 'uninstall' ? 'Remove Controller Adder from' :
+      operation === 'update' ? 'Update the controller patch for' : 'Install controller support for';
+    if (!confirm(action + ' this game?\n\n' + catalog.game_path +
+        '\n\nClose the game and its editor before continuing.')) return;
+    if (report !== catalog || scannedPath !== $selectedGamePath.trim()) return;
+    const current = requestId;
+    busy = true;
+    patchError = '';
+    patchNotice = '';
+    let failure = '';
+    try {
+      if (operation === 'uninstall') {
+        await invoke('uninstall_controller_patch', { gamePath: catalog.game_path });
+        if (current === requestId) patchNotice = 'Controller patch removed. Recovery backups retained.';
+      } else if (operation === 'install') {
+        const result = await invoke<{backup: string}>('install_controller_patch', { profile });
+        if (current === requestId) patchNotice = 'Controller support installed. Registry backup: ' + result.backup;
+      } else {
+        const result = await invoke<{changed: boolean; previous_plugin_backup: string | null}>('update_controller_patch', { profile });
+        if (current === requestId) patchNotice = result.changed
+          ? 'Controller patch updated. Previous plugin backup: ' + result.previous_plugin_backup
+          : 'Installed plugin already matches the current bindings.';
+      }
+    } catch (cause) {
+      failure = String(cause);
+    } finally {
+      if (current === requestId && report === catalog) {
+        await refreshPatchStatus(catalog);
+        if (current === requestId && failure) patchError = failure + (patchError ? ' | Status check: ' + patchError : '');
+      }
+      busy = false;
+    }
+  }
+
+  $: patchStatusContext(report);
+  function patchStatusContext(catalog: MappingCatalog | null) {
+    patchNotice = '';
+    void refreshPatchStatus(catalog);
+  }
+
   async function save() {
     const profile = createProfile();
     if (!profile) return;
@@ -331,14 +407,14 @@
 <section class="mapping-editor">
   <header>
     <h1>Controller Mapping Editor</h1>
-    <p>Assign gamepad buttons and stick directions to engine and plugin actions. Profiles are drafts only; nothing is patched into the game.</p>
+    <p>Assign gamepad buttons and stick directions to engine and plugin actions. Review your bindings, then install or update controller support directly.</p>
   </header>
 
   <form class="scan-panel" on:submit|preventDefault={scan}>
     <label for="mapping-path">Game directory</label>
     <div class="path-row">
       <input id="mapping-path" type="text" bind:value={$selectedGamePath}
-        placeholder="Select a game on Home, or paste its directory" spellcheck="false" />
+        placeholder="Select a game on Home, or paste its directory" disabled={busy || loading} spellcheck="false" />
       <button type="submit" disabled={busy || loading || !$selectedGamePath.trim()}>
         {loading ? 'Scanning…' : report ? 'Rescan actions' : 'Scan actions'}
       </button>
@@ -373,6 +449,38 @@
         {#each suggestionWarnings as warning}<p>{warning}</p>{/each}
       </div>
     {/if}
+
+    <section class="patch-panel" aria-label="Controller patch management">
+      <div class="patch-heading">
+        <div>
+          <h2>Controller Patch Management</h2>
+          <p>Uses the current bindings directly. No JSON export required.</p>
+        </div>
+        <button type="button" class="secondary" disabled={busy || patchChecking}
+          on:click={() => refreshPatchStatus(report)}>Refresh status</button>
+      </div>
+      <div class="patch-state">
+        <span>Installation status</span>
+        <strong class:installed={patchStatus?.state === 'installed'}
+          class:attention={patchStatus?.state === 'conflict' || patchStatus?.state === 'incomplete' || patchStatus?.state === 'disabled'}>
+          {patchChecking ? 'Checking…' : patchStatus ? patchLabels[patchStatus.state] : 'Unavailable'}
+        </strong>
+      </div>
+      {#if patchStatus}<p class="patch-detail">{patchStatus.detail}</p>{/if}
+      {#if patchStatus?.state === 'disabled'}<p class="patch-detail">Updating preserves the disabled state.</p>{/if}
+      {#if patchError}<p class="error" role="alert">{patchError}</p>{/if}
+      {#if patchNotice}<p class="notice" role="status">{patchNotice}</p>{/if}
+      <div class="patch-actions">
+        <button type="button" disabled={busy || patchChecking || patchStatus?.state !== 'not_installed' || !validation?.valid || !assigned}
+          on:click={() => managePatch('install')}>Install patch</button>
+        <button type="button" class="secondary" disabled={busy || patchChecking || !['installed','disabled'].includes(patchStatus?.state ?? '') || !validation?.valid || !assigned}
+          on:click={() => managePatch('update')}>Update patch</button>
+        <button type="button" class="danger" disabled={busy || patchChecking || !['installed','disabled'].includes(patchStatus?.state ?? '')}
+          on:click={() => managePatch('uninstall')}>Uninstall patch</button>
+      </div>
+      {#if busy}<p class="patch-detail" role="status">An editor operation is in progress…</p>{/if}
+      <p class="patch-detail">Close the game and its editor before modifying the patch. Saving a profile locally is separate from applying it.</p>
+    </section>
 
     <div class="toolbar">
       <label>Search actions <input type="search" bind:value={filter} placeholder="Action or plugin…" /></label>
@@ -438,7 +546,7 @@
       {/each}
     </div>
 
-    <p class="footnote">D-pad directions and stick movement may already work through the engine's built-in handling; these assignments are editable suggestions, not detected runtime mappings. Analog mappings use configurable thresholds and require the future runtime input-handler patch. Saved profiles are local to this app installation; Export JSON for a portable copy.</p>
+    <p class="footnote">D-pad directions and stick movement may already work through the engine's built-in handling; these assignments are editable suggestions, not detected runtime mappings. Analog mappings use configurable thresholds through the generated controller plugin. Saved profiles are local to this app installation; Export JSON for a portable copy.</p>
   {:else}
     <p class="empty">Select a game and scan its actions to begin. A game does not need pre-existing controller support.</p>
   {/if}
@@ -462,6 +570,16 @@
   button:disabled { opacity:.5; cursor:not-allowed; }
   button.secondary { background:#353545; }
   button:hover:not(:disabled) { filter:brightness(1.1); }
+  .patch-panel { display:grid; gap:.7rem; border:1px solid #8885; border-radius:.75rem; padding:1rem; }
+  .patch-heading { display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:.65rem; }
+  .patch-heading h2 { margin:0; font-size:1.15rem; }
+  .patch-heading p,.patch-detail { margin:.2rem 0; font-size:.85rem; opacity:.8; overflow-wrap:anywhere; }
+  .patch-state { display:flex; justify-content:space-between; gap:.5rem; padding:.7rem; background:#8881; border-radius:.5rem; }
+  .patch-state .installed { color:#65ce91; }
+  .patch-state .attention { color:#e8b86d; }
+  .patch-actions { display:flex; flex-wrap:wrap; gap:.6rem; }
+  button.danger { background:#742d3a; color:white; }
+  .patch-panel .error,.patch-panel .notice { margin:0; overflow-wrap:anywhere; }
   .summary { display:flex; gap:1rem; flex-wrap:wrap; }
   .summary span { padding-right:.5rem; }
   .toolbar { display:flex; flex-wrap:wrap; gap:.6rem; align-items:end; }
