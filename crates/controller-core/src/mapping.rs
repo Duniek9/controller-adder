@@ -3,16 +3,69 @@ use crate::scanner::effective::{analyze_effective_inputs, EffectiveInputReport};
 use serde::{Deserialize, Serialize};
 use std::{collections::{BTreeMap, BTreeSet}, path::Path};
 
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 // Standard browser Gamepad API button indices (not keyboard codes).
 pub const MAX_BUTTON: u32 = 15;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct MappingProfile {
     pub format_version: u32,
     pub engine: String,
     pub game_path: String,
-    pub bindings: BTreeMap<String, u32>,
+    pub bindings: BTreeMap<String, Vec<PhysicalInput>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction { Negative, Positive }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PhysicalInput {
+    Button { index: u32 },
+    Axis { index: u32, direction: Direction, threshold: f64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum InputKey { Button(u32), Axis(u32, Direction) }
+
+impl PhysicalInput {
+    fn key(&self) -> InputKey {
+        match self {
+            Self::Button { index } => InputKey::Button(*index),
+            Self::Axis { index, direction, .. } => InputKey::Axis(*index, *direction),
+        }
+    }
+}
+
+fn button(index: u32) -> PhysicalInput { PhysicalInput::Button { index } }
+fn axis(index: u32, direction: Direction) -> PhysicalInput {
+    PhysicalInput::Axis { index, direction, threshold: 0.5 }
+}
+
+impl<'de> Deserialize<'de> for MappingProfile {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Wire {
+            format_version: u32,
+            engine: String,
+            game_path: String,
+            bindings: BTreeMap<String, serde_json::Value>,
+        }
+        let wire = Wire::deserialize(d)?;
+        let bindings = wire.bindings.into_iter().map(|(action, value)| {
+            let inputs = match wire.format_version {
+                1 => serde_json::from_value::<u32>(value).map(|n| vec![button(n)]),
+                2 => serde_json::from_value::<Vec<PhysicalInput>>(value),
+                _ => return Err(serde::de::Error::custom("Unsupported profile version")),
+            }.map_err(serde::de::Error::custom)?;
+            Ok((action, inputs))
+        }).collect::<Result<BTreeMap<_, _>, D::Error>>()?;
+        if !matches!(wire.format_version, 1 | 2) {
+            return Err(serde::de::Error::custom("Unsupported profile version"));
+        }
+        Ok(Self { format_version: FORMAT_VERSION, engine: wire.engine, game_path: wire.game_path, bindings })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,9 +149,9 @@ pub fn scan_actions(path: &Path) -> Result<MappingActions, String> {
 /// Conservative suggestion: assign only recognized standard actions.
 pub fn suggest_from_actions(catalog: &MappingActions) -> MappingProfile {
     let mut bindings = BTreeMap::new();
-    for &(action, button) in DEFAULTS {
+    for (action, inputs) in preferred_inputs(SuggestionMode::Conservative) {
         if catalog.actions.iter().any(|a| a == action) {
-            bindings.insert(action.to_owned(), button);
+            bindings.insert(action.to_owned(), inputs);
         }
     }
     MappingProfile { format_version: FORMAT_VERSION, engine: catalog.engine.clone(),
@@ -124,6 +177,23 @@ pub struct SuggestionReport {
     pub warnings: Vec<String>,
 }
 
+fn preferred_inputs(mode: SuggestionMode) -> Vec<(&'static str, Vec<PhysicalInput>)> {
+    use Direction::{Negative, Positive};
+    DEFAULTS.iter().map(|&(action, index)| {
+        let stick = match action {
+            "up" => Some(axis(1, Negative)), "down" => Some(axis(1, Positive)),
+            "left" => Some(axis(0, Negative)), "right" => Some(axis(0, Positive)),
+            _ => None,
+        };
+        let inputs = match (mode, stick) {
+            (SuggestionMode::Automatic, Some(stick)) => vec![stick],
+            (_, Some(stick)) => vec![button(index), stick],
+            (_, None) => vec![button(index)],
+        };
+        (action, inputs)
+    }).collect()
+}
+
 /// Fill missing bindings only. Standard actions get their preferred buttons,
 /// and automatic mode uses remaining non-directional buttons for plugin actions.
 pub fn fill_suggestions(
@@ -143,13 +213,15 @@ pub fn fill_suggestions(
     if !validate_mapping(&profile).valid {
         return Err("Resolve invalid existing bindings before suggesting".into());
     }
-    let mut used: BTreeSet<u32> = profile.bindings.values().copied().collect();
+    let mut used: BTreeSet<InputKey> = profile.bindings.values().flatten().map(PhysicalInput::key).collect();
     let mut added = Vec::new();
-    for &(action, button) in DEFAULTS {
-        if catalog.actions.iter().any(|a| a == action)
-            && !profile.bindings.contains_key(action) && used.insert(button) {
-            profile.bindings.insert(action.into(), button);
-            added.push(action.into());
+    for (action, inputs) in preferred_inputs(mode) {
+        if catalog.actions.iter().any(|a| a == action) && !profile.bindings.contains_key(action) {
+            let available: Vec<_> = inputs.into_iter().filter(|i| used.insert(i.key())).collect();
+            if !available.is_empty() {
+                profile.bindings.insert(action.into(), available);
+                added.push(action.into());
+            }
         }
     }
     let mut warnings = Vec::new();
@@ -165,10 +237,13 @@ pub fn fill_suggestions(
             _ => 2,
         });
         for action in candidates {
-            let Some(button) = [7, 6, 11, 10, 8, 9, 4, 5, 2, 3, 0, 1]
-                .into_iter().find(|b| !used.contains(b)) else { break; };
-            used.insert(button);
-            profile.bindings.insert(action.clone(), button);
+            let pool = [7, 6, 11, 10, 8, 9, 12, 13, 14, 15, 4, 5, 2, 3, 0, 1]
+                .into_iter().map(button).chain((2..=3).flat_map(|i| [
+                    axis(i, Direction::Negative), axis(i, Direction::Positive)
+                ]));
+            let Some(input) = pool.into_iter().find(|i| !used.contains(&i.key())) else { break; };
+            used.insert(input.key());
+            profile.bindings.insert(action.clone(), vec![input]);
             added.push(action.clone());
             if catalog.evidence.get(action).map(String::as_str) != Some("configured_plugin") {
                 warnings.push(format!("{action}: static evidence only; review before use"));
@@ -192,16 +267,26 @@ pub fn validate_mapping(profile: &MappingProfile) -> MappingValidation {
     if profile.game_path.trim().is_empty() {
         errors.push(issue("missing_game_path", "Game path must not be empty"));
     }
-    let mut used = BTreeMap::<u32, &str>::new();
-    for (action, &button) in &profile.bindings {
+    let mut used = BTreeMap::<InputKey, &str>::new();
+    for (action, inputs) in &profile.bindings {
         if action.trim().is_empty() {
             errors.push(issue("empty_action", "Action names must not be blank"));
         }
-        if button > MAX_BUTTON {
-            errors.push(issue("invalid_button", format!("{action}: button {button} is outside 0..={MAX_BUTTON}")));
+        if inputs.is_empty() {
+            errors.push(issue("empty_binding", format!("{action}: no physical inputs")));
         }
-        if let Some(previous) = used.insert(button, action.as_str()) {
-            errors.push(issue("duplicate_button", format!("Button {button} is assigned to both {previous} and {action}")));
+        for input in inputs {
+            match input {
+                PhysicalInput::Button { index } if *index > MAX_BUTTON =>
+                    errors.push(issue("invalid_button", format!("{action}: invalid button {index}"))),
+                PhysicalInput::Axis { index, threshold, .. } if *index > 3 ||
+                    !threshold.is_finite() || *threshold <= 0.0 || *threshold > 1.0 =>
+                    errors.push(issue("invalid_axis", format!("{action}: invalid axis or threshold"))),
+                _ => {}
+            }
+            if let Some(previous) = used.insert(input.key(), action.as_str()) {
+                errors.push(issue("duplicate_input", format!("{:?} is assigned to both {previous} and {action}", input.key())));
+            }
         }
     }
     for action in ["ok", "cancel", "up", "down", "left", "right"] {
@@ -214,8 +299,16 @@ pub fn validate_mapping(profile: &MappingProfile) -> MappingValidation {
 
 /// Transactional in-memory edit: invalid changes leave the original untouched.
 pub fn set_binding(profile: &mut MappingProfile, action: String, button: u32) -> Result<(), String> {
+    edit_binding(profile, action, PhysicalInput::Button { index: button }, false)
+}
+
+pub fn edit_binding(profile: &mut MappingProfile, action: String, input: PhysicalInput, append: bool) -> Result<(), String> {
     let mut next = profile.clone();
-    next.bindings.insert(action, button);
+    if append {
+        next.bindings.entry(action).or_default().push(input);
+    } else {
+        next.bindings.insert(action, vec![input]);
+    }
     let validation = validate_mapping(&next);
     if !validation.valid {
         return Err(validation.errors.into_iter().map(|e| e.message).collect::<Vec<_>>().join("; "));
@@ -242,7 +335,7 @@ mod tests {
     fn suggestion_does_not_guess_custom_actions() {
         let p = suggest_from_actions(&catalog());
         assert_eq!(p.bindings.len(), 3);
-        assert_eq!(p.bindings["ok"], 0);
+        assert_eq!(p.bindings["ok"], vec![button(0)]);
         assert!(!p.bindings.contains_key("custom"));
         assert!(validate_mapping(&p).valid);
     }
@@ -263,7 +356,7 @@ mod tests {
     fn invalid_button_and_version_are_rejected() {
         let mut p = suggest_from_actions(&catalog());
         assert!(set_binding(&mut p, "custom".into(), 17).is_err());
-        p.format_version = 2;
+        p.format_version = 3;
         assert!(!validate_mapping(&p).valid);
     }
 
@@ -276,11 +369,24 @@ mod tests {
         let mut p = suggest_from_actions(&c);
         set_binding(&mut p, "manual".into(), 7).unwrap();
         let result = fill_suggestions(&c, Some(p), SuggestionMode::Automatic).unwrap();
-        assert_eq!(result.profile.bindings["manual"], 7);
-        assert_eq!(result.profile.bindings["e"], 6);
+        assert_eq!(result.profile.bindings["manual"], vec![button(7)]);
+        assert_eq!(result.profile.bindings["e"], vec![button(6)]);
         assert!(result.profile.bindings.contains_key("E"));
         assert!(validate_mapping(&result.profile).valid);
         assert!(result.unassigned.is_empty());
+    }
+
+    #[test]
+    fn old_profile_migrates_and_axis_collision_ignores_threshold() {
+        let mut p: MappingProfile = serde_json::from_str(r#"{"format_version":1,"engine":"RPG Maker MV","game_path":"/example","bindings":{"ok":0}}"#).unwrap();
+        assert_eq!(p.format_version, 2);
+        assert_eq!(p.bindings["ok"], vec![button(0)]);
+        edit_binding(&mut p, "ok".into(), axis(0, Direction::Negative), true).unwrap();
+        assert_eq!(p.bindings["ok"].len(), 2);
+        assert!(edit_binding(&mut p, "other".into(), PhysicalInput::Axis {
+            index: 0, direction: Direction::Negative, threshold: 0.8,
+        }, false).is_err());
+        assert!(edit_binding(&mut p, "other".into(), axis(0, Direction::Positive), false).is_ok());
     }
 
     #[test]
