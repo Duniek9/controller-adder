@@ -222,22 +222,19 @@
 
   async function exportProfile() {
     const profile = createProfile();
-    if (!profile) return;
+    if (!profile || busy) return;
+    const current = requestId;
+    busy = true;
+    error = '';
+    notice = '';
     try {
-      const checked = await invoke<Validation>('validate_controller_mapping', { profile });
-      if (!checked.valid) { error = 'Resolve validation errors before exporting.'; return; }
-      if (JSON.stringify(profile) !== JSON.stringify(createProfile())) return;
-    } catch (cause) { error = String(cause); return; }
-    const blob = new Blob([JSON.stringify(profile, null, 2)], { type: 'application/json' });
-    const href = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = href;
-    anchor.download = 'controller-adder-gamepad-profile.json';
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(href);
-    notice = 'JSON export requested. This does not install a patch.';
+      const path = await invoke<string>('export_mapping_profile', { profile });
+      if (current === requestId) notice = `JSON saved: ${path}. No game files were changed.`;
+    } catch (cause) {
+      if (current === requestId) error = `Could not export profile: ${String(cause)}`;
+    } finally {
+      busy = false;
+    }
   }
 
   onMount(() => { storageReady = typeof localStorage !== 'undefined'; });
