@@ -1,8 +1,14 @@
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use controller_core::mapping::{
-    scan_actions, suggest_mapping, validate_mapping, set_binding, remove_binding, MappingProfile,
+    scan_actions, fill_suggestions, validate_mapping, set_binding, remove_binding, MappingProfile, SuggestionMode,
 };
 use std::{fs, path::{Path, PathBuf}};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum Mode {
+    Conservative,
+    Automatic,
+}
 
 #[derive(Debug, Subcommand)]
 pub enum MappingCommands {
@@ -13,6 +19,11 @@ pub enum MappingCommands {
         path: PathBuf,
         #[arg(long)]
         output: Option<PathBuf>,
+        #[arg(long, value_enum, default_value = "automatic")]
+        mode: Mode,
+        /// Fill a previously exported profile without overwriting its bindings.
+        #[arg(long)]
+        existing: Option<PathBuf>,
     },
     /// Edit a profile, rejecting conflicting or invalid assignments.
     Set {
@@ -77,10 +88,16 @@ fn save(path: &Path, profile: &MappingProfile, overwrite: bool) -> Result<(), St
 pub fn execute(command: MappingCommands) -> Result<(), String> {
     match command {
         MappingCommands::Scan { path } => super::print_json(&scan_actions(&path)?),
-        MappingCommands::Suggest { path, output } => {
-            let profile = suggest_mapping(&path)?;
-            if let Some(output) = output { save(&output, &profile, false)?; }
-            super::print_json(&profile)
+        MappingCommands::Suggest { path, output, mode, existing } => {
+            let catalog = scan_actions(&path)?;
+            let existing = existing.as_deref().map(load).transpose()?;
+            let mode = match mode {
+                Mode::Conservative => SuggestionMode::Conservative,
+                Mode::Automatic => SuggestionMode::Automatic,
+            };
+            let result = fill_suggestions(&catalog, existing, mode)?;
+            if let Some(output) = output { save(&output, &result.profile, false)?; }
+            super::print_json(&result)
         }
         MappingCommands::Set { profile, action, button } => {
             let mut data = load(&profile)?;
