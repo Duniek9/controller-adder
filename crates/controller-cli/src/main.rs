@@ -23,6 +23,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Generate standalone controller plugins without installing them.
+    Patch {
+        #[command(subcommand)]
+        command: PatchCommands,
+    },
     /// Discover, suggest, edit and validate controller profiles.
     Mapping {
         #[command(subcommand)]
@@ -66,6 +71,41 @@ enum Commands {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum PatchCommands {
+    /// Generate JavaScript to stdout or a new output file.
+    Generate {
+        profile: PathBuf,
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+}
+
+fn execute_patch(command: PatchCommands) -> Result<(), String> {
+    use std::{fs, io::Write};
+    match command {
+        PatchCommands::Generate { profile, output } => {
+            let bytes = fs::read(&profile).map_err(|e| format!("Cannot read profile: {e}"))?;
+            let profile: controller_core::mapping::MappingProfile =
+                serde_json::from_slice(&bytes).map_err(|e| format!("Invalid profile: {e}"))?;
+            let plugin = controller_core::patch::generate_plugin(&profile)?;
+            if let Some(path) = output {
+                let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path)
+                    .map_err(|e| format!("Cannot create {}: {e}", path.display()))?;
+                if let Err(e) = file.write_all(plugin.as_bytes()).and_then(|_| file.sync_all()) {
+                    drop(file);
+                    let _ = fs::remove_file(&path);
+                    return Err(format!("Cannot write plugin: {e}"));
+                }
+                eprintln!("Generated {}", path.display());
+            } else {
+                print!("{plugin}");
+            }
+            Ok(())
+        }
+    }
+}
+
 fn print_json<T: Serialize>(value: &T) -> Result<(), String> {
     let json = serde_json::to_string_pretty(value)
         .map_err(|err| format!("Cannot serialize JSON: {err}"))?;
@@ -75,6 +115,7 @@ fn print_json<T: Serialize>(value: &T) -> Result<(), String> {
 
 fn execute(command: Commands) -> Result<(), String> {
     match command {
+        Commands::Patch { command } => execute_patch(command)?,
         Commands::Mapping { command } => mapping_command::execute(command)?,
         Commands::Detect { path, json } => {
             let engine = detect_engine(&path)?;
