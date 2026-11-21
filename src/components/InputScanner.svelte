@@ -1,5 +1,6 @@
 
 <script lang="ts">
+  import ReportExport from "./ReportExport.svelte";
   import { invoke } from '@tauri-apps/api/core';
 
   type KeyBinding = {
@@ -22,6 +23,7 @@
 
   let actions = $state<InputAction[]>([]);
   let isScanning = $state(false);
+  let reportPath = $state('');
   let error = $state<string | null>(null);
 
   let expandedActions = $state<string[]>([]);
@@ -54,6 +56,7 @@
         );
 
         if (!cancelled) {
+          reportPath = path;
           actions = result;
         }
       } catch (err) {
@@ -142,6 +145,10 @@
         </div>
       {/each}
     </div>
+  {/if}
+
+  {#if !isScanning && !error && reportPath === gamePath}
+    <ReportExport {gamePath} kind="inputs" report={actions} />
   {/if}
 </section>
 
