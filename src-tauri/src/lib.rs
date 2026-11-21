@@ -1,6 +1,7 @@
 mod scanner;
 mod effective_command;
 mod mapping_command;
+mod patch_command;
 
 #[tauri::command]
 fn greet(name: &str) -> String {
@@ -41,6 +42,10 @@ pub fn run() {
             mapping_command::import_mapping_profile,
             mapping_command::profile_import_directory,
             export_scan_report,
+            patch_command::controller_patch_status,
+            patch_command::install_controller_patch,
+            patch_command::update_controller_patch,
+            patch_command::uninstall_controller_patch,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
