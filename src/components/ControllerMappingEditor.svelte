@@ -3,29 +3,19 @@
   import { onMount } from 'svelte';
   import { selectedGamePath } from '../lib/stores/selectedGame';
 
-  type MappingCandidate = {
-    plugin: string;
-    action: string;
-    configuration_status: string;
-    context: string;
-  };
-  type InputSlot = {
-    input_kind: string;
-    input_index: number;
-    key_name?: string;
-    core_default_actions: string[];
-    plugin_candidates: MappingCandidate[];
-    status: string;
-  };
-  type ActionEntry = { action: string; classification: string; references: number };
-  type EffectiveReport = {
-    schema_version: number;
+  type MappingCatalog = {
     engine: string;
-    inputs: InputSlot[];
-    unresolved_actions: ActionEntry[];
-    candidate_mapped_actions: ActionEntry[];
+    game_path: string;
+    actions: string[];
+    evidence: Record<string, string>;
     warnings: string[];
   };
+  type Validation = {
+    valid: boolean;
+    errors: { code: string; message: string }[];
+    warnings: { code: string; message: string }[];
+  };
+  type Suggestion = { profile: Profile; unassigned: string[]; added: string[]; warnings: string[] };
   type ActionOption = { id: string; kind: 'core' | 'plugin' | 'unresolved'; evidence: string };
   type Profile = {
     format_version: 1;
@@ -52,15 +42,13 @@
     { index: 14, label: 'D-pad left' },
     { index: 15, label: 'D-pad right' }
   ];
-  const buttonNames = new Map(buttons.map((button) => [button.index, button.label]));
-  const recommended: Record<string, number> = {
-    ok: 0, cancel: 1, shift: 2, menu: 3,
-    pageup: 4, pagedown: 5,
-    up: 12, down: 13, left: 14, right: 15
-  };
   const storagePrefix = 'controller-adder:gamepad-profile:v1:';
 
-  let report: EffectiveReport | null = null;
+  let report: MappingCatalog | null = null;
+  let validation: Validation | null = null;
+  let validationId = 0;
+  let busy = false;
+  let suggestionWarnings: string[] = [];
   let scannedPath = '';
   let error = '';
   let notice = '';
@@ -75,39 +63,16 @@
     return storagePrefix + gamePath;
   }
 
-  function uniqueOptions(input: EffectiveReport): ActionOption[] {
-    const result = new Map<string, ActionOption>();
-    function add(id: string, kind: ActionOption['kind'], evidence: string) {
-      if (!id || result.has(id)) return;
-      result.set(id, { id, kind, evidence });
-    }
-
-    for (const slot of input.inputs) {
-      for (const action of slot.core_default_actions) {
-        add(action, 'core', 'RPG Maker default');
-      }
-    }
-    // RPG Maker accepts cancel and menu as Escape-compatible engine actions.
-    add('cancel', 'core', 'Engine-compatible action');
-    add('menu', 'core', 'Engine-compatible action');
-
-    for (const slot of input.inputs) {
-      for (const candidate of slot.plugin_candidates) {
-        if (candidate.configuration_status === 'disabled_by_configuration') continue;
-        add(candidate.action, 'plugin', `${candidate.plugin} · ${candidate.configuration_status.replaceAll('_', ' ')}`);
-      }
-    }
-    for (const entry of input.candidate_mapped_actions) {
-      add(entry.action, 'plugin', 'Unverified plugin mapper');
-    }
-    for (const entry of input.unresolved_actions) {
-      add(entry.action, 'unresolved', `${entry.references} reference(s); no verified mapping`);
-    }
-
-    const order: Record<ActionOption['kind'], number> = { core: 0, plugin: 1, unresolved: 2 };
-    return [...result.values()].sort((a, b) =>
-      order[a.kind] - order[b.kind] || a.id.localeCompare(b.id)
-    );
+  function uniqueOptions(input: MappingCatalog): ActionOption[] {
+    return input.actions.map((id) => {
+      const evidence = input.evidence[id] ?? 'unresolved';
+      const kind: ActionOption['kind'] = evidence === 'core' ? 'core'
+        : evidence === 'unresolved' ? 'unresolved' : 'plugin';
+      return { id, kind, evidence: evidence.replaceAll('_', ' ') };
+    }).sort((a, b) => {
+      const order = { core: 0, plugin: 1, unresolved: 2 };
+      return order[a.kind] - order[b.kind] || a.id.localeCompare(b.id);
+    });
   }
 
   function readProfile(gamePath: string, engine: string): Record<string, number> {
@@ -121,10 +86,8 @@
       if (profile.format_version !== 1 || profile.engine !== engine || !profile.bindings ||
           typeof profile.bindings !== 'object' || Array.isArray(profile.bindings)) return {};
       const restored: Record<string, number> = {};
-      const validActions = new Set(uniqueOptions(report!).map((item) => item.id));
       for (const [action, button] of Object.entries(profile.bindings)) {
-        if (validActions.has(action) && typeof button === 'number' &&
-            Number.isInteger(button) && button >= 0 && button <= 15) {
+        if (typeof button === 'number' && Number.isInteger(button) && button >= 0) {
           restored[action] = button;
         }
       }
@@ -146,11 +109,9 @@
     report = null;
     bindings = {};
     try {
-      const found = await invoke<EffectiveReport>('scan_effective_inputs', { gamePath: path });
+      const found = await invoke<MappingCatalog>('scan_mapping_actions', { gamePath: path });
       if (current !== requestId || $selectedGamePath.trim() !== path) return;
-      if (found.schema_version !== 2) {
-        throw new Error(`Unsupported effective-input schema ${found.schema_version}; expected 2.`);
-      }
+
       report = found;
       scannedPath = path;
       bindings = readProfile(path, found.engine);
@@ -174,17 +135,25 @@
     notice = '';
   }
 
-  function applySuggestions() {
-    if (!report) return;
-    const updated = { ...bindings };
-    for (const action of options) {
-      if (!(action.id in updated) && action.id in recommended) {
-        updated[action.id] = recommended[action.id];
-      }
+  async function applySuggestions(mode: 'automatic' | 'conservative') {
+    const profile = createProfile();
+    const catalog = report;
+    if (!profile || !catalog || busy) return;
+    const current = requestId;
+    busy = true;
+    error = '';
+    try {
+      const result = await invoke<Suggestion>('suggest_controller_mapping', { catalog, profile, mode });
+      if (current !== requestId || report !== catalog) return;
+      bindings = result.profile.bindings;
+      suggestionWarnings = result.warnings;
+      dirty = true;
+      notice = `Added ${result.added.length} bindings; ${result.unassigned.length} detected actions remain unassigned. Review before saving.`;
+    } catch (cause) {
+      if (current === requestId) error = String(cause);
+    } finally {
+      busy = false;
     }
-    bindings = updated;
-    dirty = true;
-    notice = 'Suggested defaults filled in. Review them before saving.';
   }
 
   function createProfile(): Profile | null {
@@ -192,16 +161,19 @@
     return {
       format_version: 1,
       engine: report.engine,
-      game_path: scannedPath,
+      game_path: report.game_path,
       bindings: { ...bindings }
     };
   }
 
-  function save() {
+  async function save() {
     const profile = createProfile();
     if (!profile) return;
     if (!storageReady) { error = 'Local storage is not available.'; return; }
     try {
+      const checked = await invoke<Validation>('validate_controller_mapping', { profile });
+      if (!checked.valid) { error = 'Resolve validation errors before saving.'; return; }
+      if (JSON.stringify(profile) !== JSON.stringify(createProfile())) return;
       localStorage.setItem(profileKey(scannedPath), JSON.stringify(profile));
       dirty = false;
       error = '';
@@ -211,9 +183,14 @@
     }
   }
 
-  function exportProfile() {
+  async function exportProfile() {
     const profile = createProfile();
     if (!profile) return;
+    try {
+      const checked = await invoke<Validation>('validate_controller_mapping', { profile });
+      if (!checked.valid) { error = 'Resolve validation errors before exporting.'; return; }
+      if (JSON.stringify(profile) !== JSON.stringify(createProfile())) return;
+    } catch (cause) { error = String(cause); return; }
     const blob = new Blob([JSON.stringify(profile, null, 2)], { type: 'application/json' });
     const href = URL.createObjectURL(blob);
     const anchor = document.createElement('a');
@@ -233,15 +210,20 @@
     `${item.id} ${item.evidence}`.toLowerCase().includes(filter.trim().toLowerCase())
   );
   $: assigned = Object.keys(bindings).length;
-  $: duplicates = Object.entries(
-    Object.entries(bindings).reduce<Record<number, string[]>>((groups, [action, index]) => {
-      (groups[index] ??= []).push(action);
-      return groups;
-    }, {})
-  ).filter(([, actions]) => actions.length > 1);
-  $: missingEssentials = ['ok', 'cancel'].filter((action) =>
-    options.some((option) => option.id === action) && !(action in bindings)
-  );
+  async function refreshValidation(catalog: MappingCatalog | null, currentBindings: Record<string, number>) {
+    const id = ++validationId;
+    validation = null;
+    if (!catalog) return;
+    try {
+      const result = await invoke<Validation>('validate_controller_mapping', {
+        profile: { format_version: 1, engine: catalog.engine, game_path: catalog.game_path, bindings: currentBindings }
+      });
+      if (id === validationId) validation = result;
+    } catch (cause) {
+      if (id === validationId) error = String(cause);
+    }
+  }
+  $: void refreshValidation(report, bindings);
   $: if (scannedPath && $selectedGamePath.trim() !== scannedPath) {
     requestId += 1;
     report = null;
@@ -249,6 +231,7 @@
     dirty = false;
     scannedPath = '';
     notice = '';
+    suggestionWarnings = [];
   }
 </script>
 
@@ -263,7 +246,7 @@
     <div class="path-row">
       <input id="mapping-path" type="text" bind:value={$selectedGamePath}
         placeholder="Select a game on Home, or paste its directory" spellcheck="false" />
-      <button type="submit" disabled={loading || !$selectedGamePath.trim()}>
+      <button type="submit" disabled={busy || loading || !$selectedGamePath.trim()}>
         {loading ? 'Scanning…' : report ? 'Rescan actions' : 'Scan actions'}
       </button>
     </div>
@@ -280,26 +263,29 @@
       <span>{dirty ? 'Unsaved changes' : 'No unsaved changes'}</span>
     </div>
 
-    {#if duplicates.length}
+    {#if validation && validation.errors.length}
       <div class="warning" role="alert">
-        <strong>Duplicate button assignments</strong>
-        {#each duplicates as [index, actions]}
-          <p>{buttonNames.get(Number(index)) ?? `Button ${index}`} → {actions.join(', ')}</p>
-        {/each}
-        <small>One physical button maps to one action in a simple RPG Maker mapper. Resolve duplicates before generating a future patch.</small>
+        <strong>Invalid bindings</strong>
+        {#each validation.errors as issue}<p>{issue.message}</p>{/each}
       </div>
     {/if}
-    {#if missingEssentials.length}
+    {#if validation && validation.warnings.length}
       <div class="warning">
-        Missing essential mappings: <strong>{missingEssentials.join(', ')}</strong>.
+        {#each validation.warnings as issue}<p>{issue.message}</p>{/each}
+      </div>
+    {/if}
+    {#if suggestionWarnings.length}
+      <div class="warning">
+        {#each suggestionWarnings as warning}<p>{warning}</p>{/each}
       </div>
     {/if}
 
     <div class="toolbar">
       <label>Search actions <input type="search" bind:value={filter} placeholder="Action or plugin…" /></label>
-      <button type="button" class="secondary" on:click={applySuggestions}>Fill suggested defaults</button>
-      <button type="button" on:click={save}>Save profile locally</button>
-      <button type="button" class="secondary" on:click={exportProfile}>Export JSON</button>
+      <button type="button" class="secondary" disabled={busy || !validation?.valid} on:click={() => applySuggestions('automatic')}>Auto-assign plugin actions</button>
+      <button type="button" class="secondary" disabled={busy || !validation?.valid} on:click={() => applySuggestions('conservative')}>Fill standard defaults</button>
+      <button type="button" disabled={busy || !validation?.valid} on:click={save}>Save profile locally</button>
+      <button type="button" class="secondary" disabled={busy || !validation?.valid} on:click={exportProfile}>Export JSON</button>
     </div>
 
     <div class="rows">
@@ -312,7 +298,7 @@
           </div>
           <label>
             <span class="sr-only">Gamepad button for {item.id}</span>
-            <select value={item.id in bindings ? String(bindings[item.id]) : ''}
+            <select disabled={busy} value={item.id in bindings ? String(bindings[item.id]) : ''}
               on:change={(event) => changeButton(item.id, event.currentTarget.value)}>
               <option value="">Unassigned</option>
               {#each buttons as button}
