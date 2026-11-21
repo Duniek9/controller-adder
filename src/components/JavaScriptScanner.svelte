@@ -1,5 +1,6 @@
 
 <script lang="ts">
+  import ReportExport from "./ReportExport.svelte";
   import { invoke } from '@tauri-apps/api/core';
 
   type JavaScriptInputFinding = {
@@ -30,6 +31,7 @@
 
   let report = $state<JavaScriptScanReport | null>(null);
   let isScanning = $state(false);
+  let reportPath = $state('');
   let error = $state<string | null>(null);
 
   let categoryFilter = $state('all');
@@ -140,6 +142,7 @@
         );
 
         if (!cancelled) {
+          reportPath = path;
           report = result;
         }
       } catch (err) {
@@ -286,6 +289,10 @@
       Static analysis only. Findings indicate potential
       input-handling code, not verified working controls.
     </p>
+  {/if}
+
+  {#if !isScanning && !error && reportPath === gamePath && report}
+    <ReportExport {gamePath} kind="javascript" report={report} />
   {/if}
 </section>
 
