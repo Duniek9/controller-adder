@@ -336,6 +336,82 @@ pub fn uninstall_plugin(game_path: &Path) -> Result<UninstallReport, String> {
     Ok(UninstallReport { registry, removed_plugin: plugin, original_backup_archive: archive, pre_uninstall_backup: before })
 }
 
+
+#[derive(Debug, Serialize)]
+pub struct UpdateReport {
+    pub engine: String,
+    pub state: PatchState,
+    pub plugin: PathBuf,
+    pub changed: bool,
+    pub previous_plugin_backup: Option<PathBuf>,
+}
+
+/// Replace only the recognized generated plugin. The game and editor must be closed.
+pub fn update_plugin(profile: &MappingProfile) -> Result<UpdateReport, String> {
+    let generated = generate_plugin(profile)?;
+    let game_path = Path::new(&profile.game_path);
+    let status = patch_status(game_path)?;
+    if !matches!(status.state, PatchState::Installed | PatchState::Disabled) {
+        return Err(format!("Cannot safely update: {:?}: {}", status.state, status.detail));
+    }
+    if profile.engine != status.engine {
+        return Err(format!("Profile engine does not match game: {}", status.engine));
+    }
+    let (_, plugin, registry, backup, staged) = locate(game_path)?;
+    plain(&plugin, false)?;
+    plain(&backup, false)?;
+    let previous = fs::read(&plugin).map_err(|e| e.to_string())?;
+    if !recognized_plugin(std::str::from_utf8(&previous).map_err(|e| e.to_string())?) {
+        return Err("Plugin changed before update".into());
+    }
+    let original_registry = fs::read(&registry).map_err(|e| e.to_string())?;
+    let original_backup = fs::read(&backup).map_err(|e| e.to_string())?;
+    let entries = parse_registry(std::str::from_utf8(&original_registry).map_err(|e| e.to_string())?)?.0;
+    let matches: Vec<_> = entries.iter().filter(|v| is_ours(v)).collect();
+    if matches.len() != 1 || matches[0].get("name").and_then(Value::as_str) != Some("ControllerAdder") {
+        return Err("Registry changed before update".into());
+    }
+    if parse_registry(std::str::from_utf8(&original_backup).map_err(|e| e.to_string())?)?.0.iter().any(is_ours) {
+        return Err("Invalid original backup".into());
+    }
+    let state = if matches[0].get("status").and_then(Value::as_bool) == Some(true) { PatchState::Installed } else { PatchState::Disabled };
+    if previous == generated.as_bytes() {
+        return Ok(UpdateReport { engine: status.engine, state, plugin, changed: false, previous_plugin_backup: None });
+    }
+    let permissions = fs::metadata(&plugin).map_err(|e| e.to_string())?.permissions();
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
+    let directory = plugin.parent().ok_or("Invalid plugin path")?;
+    let archive = directory.join(format!("ControllerAdder.js.pre-update-{stamp}.bak"));
+    let replacement = directory.join(".ControllerAdder.js.controller-adder.tmp");
+    // Use the same exclusive staging marker as uninstall so neither operation
+    // can begin a replacement while the other holds it.
+    create_file(&staged, b"Controller Adder update in progress", None)?;
+    let mut replacement_created = false;
+    let result = (|| -> Result<(), String> {
+        create_file(&archive, &previous, Some(permissions.clone()))?;
+        create_file(&replacement, generated.as_bytes(), Some(permissions))?;
+        replacement_created = true;
+        plain(&plugin, false)?;
+        plain(&registry, false)?;
+        plain(&backup, false)?;
+        if fs::read(&plugin).map_err(|e| e.to_string())? != previous
+            || fs::read(&registry).map_err(|e| e.to_string())? != original_registry
+            || fs::read(&backup).map_err(|e| e.to_string())? != original_backup {
+            return Err("Game files changed during update".into());
+        }
+        fs::rename(&replacement, &plugin).map_err(|e| format!("Cannot replace plugin: {e}"))?;
+        replacement_created = false;
+        Ok(())
+    })();
+    if replacement_created { let _ = fs::remove_file(&replacement); }
+    let cleanup = fs::remove_file(&staged);
+    if let Err(e) = result {
+        return Err(format!("{e}. Recovery archive (if created): {}. Staging cleanup: {:?}", archive.display(), cleanup));
+    }
+    cleanup.map_err(|e| format!("Plugin updated, but transaction marker cleanup failed: {e}. Backup: {}", archive.display()))?;
+    Ok(UpdateReport { engine: status.engine, state, plugin, changed: true, previous_plugin_backup: Some(archive) })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +453,20 @@ mod tests {
             let modified = registry.replace("\"status\":true", "\"status\":false");
             fs::write(&report.registry, &modified).unwrap();
             assert_eq!(patch_status(path).unwrap().state, PatchState::Disabled);
+            let initial_plugin = fs::read(&report.plugin).unwrap();
+            let initial_backup = fs::read(&report.backup).unwrap();
+            let unchanged = update_plugin(&profile).unwrap();
+            assert!(!unchanged.changed);
+            let mut revised: MappingProfile = serde_json::from_value(serde_json::to_value(&profile).unwrap()).unwrap();
+            revised.bindings.insert("ok".into(), vec![PhysicalInput::Button { index: 2 }]);
+            let updated = update_plugin(&revised).unwrap();
+            assert!(updated.changed);
+            assert_eq!(updated.state, PatchState::Disabled);
+            assert_eq!(fs::read(updated.previous_plugin_backup.unwrap()).unwrap(), initial_plugin);
+            assert_eq!(fs::read_to_string(&report.plugin).unwrap(), generate_plugin(&revised).unwrap());
+            assert_eq!(fs::read_to_string(&report.registry).unwrap(), modified);
+            assert_eq!(fs::read(&report.backup).unwrap(), initial_backup);
+            assert!(!update_plugin(&revised).unwrap().changed);
             let registry = modified.replace("];", ",{\"name\":\"Later\",\"status\":true,\"parameters\":{}}];");
             fs::write(&report.registry, &registry).unwrap();
             let removed = uninstall_plugin(path).unwrap();
