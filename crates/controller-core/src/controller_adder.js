@@ -20,7 +20,7 @@
             var entry = overlay[action];
             if (entry.state !== input._currentState) return;
             if (entry.present) input._currentState[action] = entry.value;
-            else delete input._currentState[action];
+            else input._currentState[action] = false;
         });
         overlay = Object.create(null);
     }
@@ -36,6 +36,8 @@
             (binding.direction === "negative" ? -value : value) >= binding.threshold;
     }
 
+    // RPG Maker copies only enumerable current-state keys to previousState.
+    // Keep released actions present as false so future presses can trigger.
     var clear = Input.clear;
     Input.clear = function() {
         restore(this);
